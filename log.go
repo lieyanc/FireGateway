@@ -119,7 +119,7 @@ func (m multiHandler) WithGroup(name string) slog.Handler {
 	return out
 }
 
-// rotateWriter writes to logDir/fireproxy-YYYY-MM-DD.log, rotating by size and
+// rotateWriter writes to logDir/firegateway-YYYY-MM-DD.log, rotating by size and
 // date, and keeps at most maxFiles log files.
 type rotateWriter struct {
 	mu       sync.Mutex
@@ -140,7 +140,7 @@ func newRotateWriter(dir string, maxSize int64, maxFiles int) (*rotateWriter, er
 }
 
 func (w *rotateWriter) path() string {
-	return filepath.Join(w.dir, "fireproxy-"+w.day+".log")
+	return filepath.Join(w.dir, "firegateway-"+w.day+".log")
 }
 
 func (w *rotateWriter) open() error {
@@ -185,7 +185,7 @@ func (w *rotateWriter) rotate() error {
 }
 
 func (w *rotateWriter) cleanup() {
-	matches, _ := filepath.Glob(filepath.Join(w.dir, "fireproxy-*.log"))
+	matches, _ := filepath.Glob(filepath.Join(w.dir, "firegateway-*.log"))
 	if len(matches) < w.maxFiles {
 		return
 	}

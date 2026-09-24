@@ -1,16 +1,16 @@
-# FireProxy
+# FireGateway
 
 High-performance TCP/UDP port forwarder written in Go. Single static binary, no dependencies.
 
-> The original Node.js implementation lives on the `legacy` branch. Its `config.json` works unchanged.
+> The original Node.js implementation lives in [lieyanc/FireProxy](https://github.com/lieyanc/FireProxy) (also the `legacy` branch). Its `config.json` works unchanged.
 
 ## Build & Run
 
 ```bash
-go build -trimpath -ldflags "-s -w" -o fireproxy .
+go build -trimpath -ldflags "-s -w" -o firegateway .
 cp config.example.json config.json
-./fireproxy              # reads ./config.json
-./fireproxy -c /etc/fireproxy.json
+./firegateway              # reads ./config.json
+./firegateway -c /etc/firegateway.json
 ```
 
 ## Configuration

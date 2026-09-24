@@ -1,5 +1,5 @@
 config.json
 logs/
 *.log
-/fireproxy
+/firegateway
 /dist/

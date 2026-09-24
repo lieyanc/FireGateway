@@ -19,7 +19,7 @@ func main() {
 	showVersion := flag.Bool("v", false, "print version and exit")
 	flag.Parse()
 	if *showVersion {
-		fmt.Println("FireProxy", version)
+		fmt.Println("FireGateway", version)
 		return
 	}
 
