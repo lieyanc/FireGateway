@@ -1,0 +1,346 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# All branch builds publish the same rolling `dev` tag/release. Cancel an older
+# branch run before a newer one can overwrite it; tag releases remain isolated
+# by their full ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_type == 'branch' && 'dev' || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    name: Build Metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      commit: ${{ steps.meta.outputs.commit }}
+      build_time: ${{ steps.meta.outputs.build_time }}
+    steps:
+      - name: Resolve version metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::7}"
+          BUILD_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [[ "${GITHUB_REF}" == refs/heads/master || "${GITHUB_REF}" == refs/heads/main ]]; then
+            # dev-{run}-{date}-{sha} is parsed by internal/updater (parseDevTag).
+            DATE="$(date -u +'%Y%m%d')"
+            RUN_NUM="$(printf '%04d' "${GITHUB_RUN_NUMBER}")"
+            VERSION="dev-${RUN_NUM}-${DATE}-${SHORT_SHA}"
+          else
+            VERSION="dev"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "commit=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "build_time=${BUILD_TIME}" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # The Go server embeds web/dist, so it must exist before vet/test.
+      - name: Build frontend
+        run: |
+          npm ci --prefix web
+          npm run --prefix web build
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Go test
+        run: go test -race ./...
+
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    needs:
+      - meta
+      - test
+    strategy:
+      fail-fast: false
+      matrix:
+        # target must match internal/updater targetName(): {goos}-{goarch}.
+        include:
+          - target: linux-amd64
+            goos: linux
+            goarch: amd64
+            ext: ""
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+            ext: ""
+          - target: linux-riscv64
+            goos: linux
+            goarch: riscv64
+            ext: ""
+          - target: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            ext: ""
+          - target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            ext: ""
+          - target: windows-amd64
+            goos: windows
+            goarch: amd64
+            ext: ".exe"
+          - target: windows-arm64
+            goos: windows
+            goarch: arm64
+            ext: ".exe"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build frontend
+        run: |
+          npm ci --prefix web
+          npm run --prefix web build
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          VERSION="${{ needs.meta.outputs.version }}"
+          COMMIT="${{ needs.meta.outputs.commit }}"
+          BUILD_TIME="${{ needs.meta.outputs.build_time }}"
+          PKG="github.com/lieyanc/FireGateway/internal/version"
+
+          go build -trimpath \
+            -ldflags="-s -w -X ${PKG}.Version=${VERSION} -X ${PKG}.Commit=${COMMIT} -X ${PKG}.BuildTime=${BUILD_TIME}" \
+            -o "dist/firegateway-${{ matrix.target }}${{ matrix.ext }}" ./cmd/firegateway
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firegateway-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 3
+
+  release-dev:
+    name: Publish Dev Release
+    runs-on: ubuntu-latest
+    needs:
+      - meta
+      - build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firegateway-*
+          path: release
+          merge-multiple: true
+
+      - name: Add version metadata
+        run: |
+          set -euo pipefail
+          cat > release/version.json <<'EOF'
+          {
+            "version": "${{ needs.meta.outputs.version }}",
+            "commit": "${{ needs.meta.outputs.commit }}",
+            "build_time": "${{ needs.meta.outputs.build_time }}",
+            "tag": "dev"
+          }
+          EOF
+
+      - name: Verify release asset set
+        run: |
+          set -euo pipefail
+          expected=(
+            firegateway-linux-amd64
+            firegateway-linux-arm64
+            firegateway-linux-riscv64
+            firegateway-darwin-amd64
+            firegateway-darwin-arm64
+            firegateway-windows-amd64.exe
+            firegateway-windows-arm64.exe
+          )
+          for binary in "${expected[@]}"; do
+            test -f "release/${binary}" || { echo "missing release/${binary}" >&2; exit 1; }
+          done
+
+      # Single manifest for every platform. Run inside release/ so the second
+      # column is the bare file name the updater matches exactly; the glob
+      # excludes version.json and SHA256SUMS itself.
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum firegateway-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Refresh dev tag and prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release delete dev --repo "${GITHUB_REPOSITORY}" --yes --cleanup-tag || true
+          git tag -f dev "${GITHUB_SHA}"
+          git push --force origin refs/tags/dev
+          # --latest=false keeps releases/latest pointing at the newest stable
+          # release, which the updater's stable channel resolves through.
+          gh release create dev release/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Dev Build #${GITHUB_RUN_NUMBER} (${{ needs.meta.outputs.commit }})" \
+            --notes "Dev build for ${GITHUB_SHA}" \
+            --prerelease \
+            --target "${GITHUB_SHA}" \
+            --latest=false
+
+  release-prod:
+    name: Publish Prod Release
+    runs-on: ubuntu-latest
+    needs:
+      - meta
+      - build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: firegateway-*
+          path: release
+          merge-multiple: true
+
+      - name: Add version metadata
+        run: |
+          set -euo pipefail
+          cat > release/version.json <<'EOF'
+          {
+            "version": "${{ needs.meta.outputs.version }}",
+            "commit": "${{ needs.meta.outputs.commit }}",
+            "build_time": "${{ needs.meta.outputs.build_time }}",
+            "tag": "${{ github.ref_name }}"
+          }
+          EOF
+
+      - name: Verify release asset set
+        run: |
+          set -euo pipefail
+          expected=(
+            firegateway-linux-amd64
+            firegateway-linux-arm64
+            firegateway-linux-riscv64
+            firegateway-darwin-amd64
+            firegateway-darwin-arm64
+            firegateway-windows-amd64.exe
+            firegateway-windows-arm64.exe
+          )
+          for binary in "${expected[@]}"; do
+            test -f "release/${binary}" || { echo "missing release/${binary}" >&2; exit 1; }
+          done
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum firegateway-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          prerelease: false
+          generate_release_notes: true
+          make_latest: true
+          files: release/*
+
+  cleanup-artifacts:
+    name: Clean Up Old Artifacts
+    needs:
+      - build
+      - release-dev
+      - release-prod
+    if: ${{ always() && !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete artifacts from previous runs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner, repo, per_page: 100 },
+            );
+
+            const runStatus = new Map();
+            for (const artifact of artifacts) {
+              const runId = artifact.workflow_run?.id;
+              if (!runId || runId === context.runId) continue;
+              if (!runStatus.has(runId)) {
+                const { data: run } = await github.rest.actions.getWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: runId,
+                });
+                runStatus.set(runId, run.status);
+              }
+              // Never delete an artifact that another queued/in-progress run
+              // may still need for its release job.
+              if (runStatus.get(runId) !== 'completed') continue;
+              await github.rest.actions.deleteArtifact({
+                owner,
+                repo,
+                artifact_id: artifact.id,
+              });
+            }

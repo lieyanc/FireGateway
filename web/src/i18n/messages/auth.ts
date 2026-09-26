@@ -1,0 +1,76 @@
+import { defineMessages } from "@/i18n/define"
+
+export const auth = defineMessages({
+  en: {
+    username: "Username",
+    password: "Password",
+    confirmPassword: "Confirm password",
+    showPassword: "Show password",
+    hidePassword: "Hide password",
+    login: {
+      title: "Sign in",
+      description: "Sign in to manage your FireGateway instance.",
+      submit: "Sign in",
+      submitting: "Signing in…",
+      invalid: "Incorrect username or password.",
+      rateLimited: "Too many failed attempts. Try again in {seconds}s.",
+      rateLimitedNoWait: "Too many failed attempts. Try again later.",
+    },
+    setup: {
+      title: "Welcome to FireGateway",
+      description: "Create the administrator account to finish setup.",
+      token: "Setup token",
+      tokenPlaceholder: "Paste the setup token",
+      tokenHelp:
+        "A one-time setup token is printed in the server log when FireGateway starts without an administrator. Check the console output or the log file (firegateway-YYYY-MM-DD.log in the log directory).",
+      tokenInvalid: "The setup token is invalid. Copy it again from the server log.",
+      alreadyInitialized: "An administrator already exists. Please sign in.",
+      submit: "Create account",
+      submitting: "Creating…",
+      success: "Administrator account created",
+    },
+    validation: {
+      usernameRequired: "Enter a username",
+      usernameLength: "Username must be 1–64 characters",
+      passwordLength: "Password must be 8–128 characters",
+      passwordMismatch: "Passwords do not match",
+      tokenRequired: "Enter the setup token",
+    },
+  },
+  zh: {
+    username: "用户名",
+    password: "密码",
+    confirmPassword: "确认密码",
+    showPassword: "显示密码",
+    hidePassword: "隐藏密码",
+    login: {
+      title: "登录",
+      description: "登录以管理你的 FireGateway 实例。",
+      submit: "登录",
+      submitting: "登录中…",
+      invalid: "用户名或密码错误。",
+      rateLimited: "失败次数过多，请在 {seconds} 秒后重试。",
+      rateLimitedNoWait: "失败次数过多，请稍后再试。",
+    },
+    setup: {
+      title: "欢迎使用 FireGateway",
+      description: "创建管理员账户以完成初始化。",
+      token: "初始化令牌",
+      tokenPlaceholder: "粘贴初始化令牌",
+      tokenHelp:
+        "当 FireGateway 在没有管理员账户的情况下启动时，会在服务端日志中打印一次性初始化令牌。请查看控制台输出或日志目录中的日志文件（firegateway-YYYY-MM-DD.log）。",
+      tokenInvalid: "初始化令牌无效，请从服务端日志中重新复制。",
+      alreadyInitialized: "管理员账户已存在，请直接登录。",
+      submit: "创建账户",
+      submitting: "创建中…",
+      success: "管理员账户已创建",
+    },
+    validation: {
+      usernameRequired: "请输入用户名",
+      usernameLength: "用户名长度需为 1–64 个字符",
+      passwordLength: "密码长度需为 8–128 个字符",
+      passwordMismatch: "两次输入的密码不一致",
+      tokenRequired: "请输入初始化令牌",
+    },
+  },
+})

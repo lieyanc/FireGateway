@@ -3,7 +3,7 @@
     "enabled": true,
     "host": "127.0.0.1",
     "port": 8080,
-    "enableCors": true
+    "enableCors": false
   },
   "logging": {
     "level": "info",
@@ -13,6 +13,14 @@
     "maxFileSize": 10485760,
     "maxFiles": 5
   },
+  "update": {
+    "enabled": false,
+    "channel": "stable",
+    "checkInterval": 3600,
+    "source": "github",
+    "repo": "lieyanc/FireGateway"
+  },
+  "dataDir": "./data",
   "forward": [
     {
       "id": 1,
@@ -53,6 +61,19 @@
       "localPortRange": [6000, 6005],
       "targetHost": "192.168.1.11",
       "targetPortRange": [7000, 7005]
+    },
+    {
+      "id": "ssh-office",
+      "name": "SSH with access control and limits",
+      "type": "tcp",
+      "status": "inactive",
+      "localHost": "0.0.0.0",
+      "localPort": 2222,
+      "targetHost": "10.0.0.5",
+      "targetPort": 22,
+      "remark": "Only the office network; at most 10 sessions, 2 per IP, 5 MB/s",
+      "acl": { "mode": "allow", "cidrs": ["203.0.113.0/24", "2001:db8::/32"] },
+      "limits": { "maxConnections": 10, "maxConnectionsPerIp": 2, "bandwidth": 5242880 }
     }
   ]
 }

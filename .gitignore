@@ -1,5 +1,7 @@
-config.json
-logs/
+/config.json
+/logs/
+/data/
 *.log
 /firegateway
+/bin/
 /dist/
