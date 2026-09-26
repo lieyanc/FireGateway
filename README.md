@@ -103,6 +103,7 @@ curl -H "Authorization: Bearer fgw_..." http://127.0.0.1:8080/api/rules
 ## Development
 
 ```bash
+make run        # full build, then run bin/firegateway (CONFIG=config.json)
 make dev        # backend on :8080 with the UI currently in web/dist
 make dev-web    # Vite dev server on :5173 proxying /api to :8080 (hot reload)
 make test       # go vet + go test -race

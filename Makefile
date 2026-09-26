@@ -1,6 +1,7 @@
-.PHONY: all web build dev dev-web test lint clean
+.PHONY: all web build run dev dev-web test lint clean
 
 BIN     ?= bin/firegateway
+CONFIG  ?= config.json
 PKG     := github.com/lieyanc/FireGateway/internal/version
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -19,9 +20,13 @@ web: web/node_modules
 build: web
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/firegateway
 
+# Full build (UI + binary), then run it.
+run: build
+	./$(BIN) -c $(CONFIG)
+
 # Backend with the UI currently in web/dist; run `make dev-web` alongside for hot reload.
 dev:
-	go run ./cmd/firegateway -c config.json
+	go run ./cmd/firegateway -c $(CONFIG)
 
 dev-web: web/node_modules
 	npm run --prefix web dev
