@@ -20,7 +20,7 @@ Download a binary from [Releases](https://github.com/lieyanc/FireGateway/release
 
 ```bash
 make build                     # builds web/ then bin/firegateway
-./bin/firegateway              # uses ./config.json, creating it if missing
+./bin/firegateway              # uses ./config.json, creating/completing it from the built-in template
 ./bin/firegateway -c /etc/firegateway/config.json
 ```
 
@@ -60,6 +60,8 @@ Self-update and the UI's restart button replace the process in place (same PID),
 
 Everything is editable from the UI; changes are written back to the config file atomically (mode `0600`, as it holds credential hashes). You can also edit the file by hand and send `SIGHUP` or click *Reload*. See `config.example.json`.
 
+The complete default configuration is a JSON template compiled into the binary ([`internal/config/template.json`](internal/config/template.json)). On start, a missing config file is created from it, and fields missing from an existing file (including new ones added by an update) are filled in from it and saved. Values already in the file are never changed.
+
 Each entry in `forward`:
 
 | Field | Description |
@@ -74,7 +76,7 @@ Each entry in `forward`:
 | `acl` | `{"mode": "allow" \| "deny", "cidrs": ["10.0.0.0/8", "203.0.113.7"]}` |
 | `limits` | `{"maxConnections", "maxConnectionsPerIp", "bandwidth"}` — bandwidth in bytes/s per direction, shared by the rule; `0` = unlimited |
 
-Other sections (all optional):
+Other sections (missing fields are filled in from the template on start):
 
 | Section | Fields |
 |---|---|
@@ -84,7 +86,7 @@ Other sections (all optional):
 | `dataDir` | Traffic history and downloaded updates (`./data`) |
 | `auth` | Managed by the UI: admin username, bcrypt hash, session secret, API token hashes |
 
-Environment fallbacks for unset fields: `API_HOST`, `API_PORT`, `LOG_LEVEL` (written into the file on the next save).
+Environment variables `API_HOST`, `API_PORT` and `LOG_LEVEL` take precedence over the template for fields that are missing when the file is created or completed.
 
 ## HTTP API
 

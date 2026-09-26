@@ -175,7 +175,7 @@ func crossSite(r *http.Request) bool {
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if config.BoolOr(s.boot.API.EnableCors, false) && strings.HasPrefix(r.URL.Path, "/api/") {
+		if s.boot.API.EnableCors && strings.HasPrefix(r.URL.Path, "/api/") {
 			// Credentials are not allowed cross-origin, so only API tokens work.
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")

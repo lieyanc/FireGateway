@@ -72,11 +72,11 @@ func Setup(c config.LogConfig) (io.Closer, error) {
 	}
 
 	handlers := []slog.Handler{&ringHandler{hub: Recent}}
-	if config.BoolOr(c.EnableConsole, true) {
+	if c.EnableConsole {
 		handlers = append(handlers, slog.NewTextHandler(os.Stdout, opts))
 	}
 	var closer io.Closer = io.NopCloser(nil)
-	if config.BoolOr(c.EnableFile, false) {
+	if c.EnableFile {
 		rw, err := newRotateWriter(c.LogDir, c.MaxFileSize, c.MaxFiles)
 		if err != nil {
 			return nil, err

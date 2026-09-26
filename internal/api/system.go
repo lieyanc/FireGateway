@@ -172,11 +172,11 @@ type settings struct {
 
 func settingsOf(c *config.Config) settings {
 	return settings{
-		API: &apiSettings{c.API.Host, c.API.Port, config.BoolOr(c.API.EnableCors, false)},
+		API: &apiSettings{c.API.Host, c.API.Port, c.API.EnableCors},
 		Logging: &logSettings{
 			Level:         c.Logging.Level,
-			EnableConsole: config.BoolOr(c.Logging.EnableConsole, true),
-			EnableFile:    config.BoolOr(c.Logging.EnableFile, false),
+			EnableConsole: c.Logging.EnableConsole,
+			EnableFile:    c.Logging.EnableFile,
 			LogDir:        c.Logging.LogDir, MaxFileSize: c.Logging.MaxFileSize, MaxFiles: c.Logging.MaxFiles,
 		},
 		Update:  &c.Update,
@@ -207,11 +207,11 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg, err := s.Store.Update(func(c *config.Config) error {
 		if a := b.API; a != nil {
-			c.API.Host, c.API.Port, c.API.EnableCors = a.Host, a.Port, config.Bool(a.EnableCors)
+			c.API.Host, c.API.Port, c.API.EnableCors = a.Host, a.Port, a.EnableCors
 		}
 		if l := b.Logging; l != nil {
 			c.Logging = config.LogConfig{
-				Level: l.Level, EnableConsole: config.Bool(l.EnableConsole), EnableFile: config.Bool(l.EnableFile),
+				Level: l.Level, EnableConsole: l.EnableConsole, EnableFile: l.EnableFile,
 				LogDir: l.LogDir, MaxFileSize: l.MaxFileSize, MaxFiles: l.MaxFiles,
 			}
 		}

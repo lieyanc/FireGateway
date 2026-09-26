@@ -3,6 +3,7 @@
 package config
 
 import (
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,27 +14,33 @@ import (
 	"time"
 )
 
+// template is the complete default configuration. It is written out when
+// no config file exists and fills in fields missing from an existing one.
+//
+//go:embed template.json
+var template []byte
+
 type Config struct {
 	API     APIConfig    `json:"api"`
 	Auth    AuthConfig   `json:"auth"`
 	Logging LogConfig    `json:"logging"`
 	Update  UpdateConfig `json:"update"`
-	DataDir string       `json:"dataDir,omitempty"`
+	DataDir string       `json:"dataDir"`
 	Forward []Rule       `json:"forward"`
 }
 
 type APIConfig struct {
-	Enabled    *bool  `json:"enabled,omitempty"`
+	Enabled    bool   `json:"enabled"`
 	Host       string `json:"host"`
 	Port       int    `json:"port"`
-	EnableCors *bool  `json:"enableCors,omitempty"`
+	EnableCors bool   `json:"enableCors"`
 }
 
 type AuthConfig struct {
 	Username      string     `json:"username,omitempty"`
 	PasswordHash  string     `json:"passwordHash,omitempty"`
 	SessionSecret string     `json:"sessionSecret,omitempty"`
-	SessionTTL    int        `json:"sessionTtl,omitempty"` // seconds
+	SessionTTL    int        `json:"sessionTtl"` // seconds
 	Tokens        []APIToken `json:"tokens,omitempty"`
 }
 
@@ -47,8 +54,8 @@ type APIToken struct {
 
 type LogConfig struct {
 	Level         string `json:"level"`
-	EnableFile    *bool  `json:"enableFile,omitempty"`
-	EnableConsole *bool  `json:"enableConsole,omitempty"`
+	EnableFile    bool   `json:"enableFile"`
+	EnableConsole bool   `json:"enableConsole"`
 	LogDir        string `json:"logDir"`
 	MaxFileSize   int64  `json:"maxFileSize"`
 	MaxFiles      int    `json:"maxFiles"`
@@ -56,59 +63,71 @@ type LogConfig struct {
 
 type UpdateConfig struct {
 	Enabled       bool   `json:"enabled"`
-	Channel       string `json:"channel,omitempty"`
-	CheckInterval int    `json:"checkInterval,omitempty"` // seconds
-	Source        string `json:"source,omitempty"`
-	ProxyBaseURL  string `json:"proxyBaseUrl,omitempty"`
-	Repo          string `json:"repo,omitempty"`
+	Channel       string `json:"channel"`
+	CheckInterval int    `json:"checkInterval"` // seconds
+	Source        string `json:"source"`
+	ProxyBaseURL  string `json:"proxyBaseUrl"`
+	Repo          string `json:"repo"`
 }
 
-const DefaultSessionTTL = 7 * 24 * 3600
-
-// Default returns the configuration written when no config file exists.
+// Default returns the embedded template. The legacy API_HOST, API_PORT and
+// LOG_LEVEL environment variables override it, so they end up in files that
+// are created or completed while they are set.
 func Default() *Config {
-	c := &Config{Forward: []Rule{}}
-	c.applyDefaults()
-	return c
+	var c Config
+	if err := json.Unmarshal(template, &c); err != nil {
+		panic("config template: " + err.Error())
+	}
+	if v := os.Getenv("API_HOST"); v != "" {
+		c.API.Host = v
+	}
+	if p, err := strconv.Atoi(os.Getenv("API_PORT")); err == nil && p > 0 {
+		c.API.Port = p
+	}
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		c.Logging.Level = v
+	}
+	return &c
 }
 
-// applyDefaults fills zero values; defaults mirror the legacy Node implementation.
+// applyDefaults resets fields that must not be empty to their defaults.
 func (c *Config) applyDefaults() {
+	d := Default()
 	if c.API.Host == "" {
-		c.API.Host = envOr("API_HOST", "127.0.0.1")
+		c.API.Host = d.API.Host
 	}
 	if c.API.Port == 0 {
-		c.API.Port, _ = strconv.Atoi(envOr("API_PORT", "8080"))
+		c.API.Port = d.API.Port
 	}
 	if c.Logging.Level == "" {
-		c.Logging.Level = envOr("LOG_LEVEL", "info")
+		c.Logging.Level = d.Logging.Level
 	}
 	if c.Logging.LogDir == "" {
-		c.Logging.LogDir = "./logs"
+		c.Logging.LogDir = d.Logging.LogDir
 	}
 	if c.Logging.MaxFileSize <= 0 {
-		c.Logging.MaxFileSize = 10 << 20
+		c.Logging.MaxFileSize = d.Logging.MaxFileSize
 	}
 	if c.Logging.MaxFiles <= 0 {
-		c.Logging.MaxFiles = 5
+		c.Logging.MaxFiles = d.Logging.MaxFiles
 	}
 	if c.Update.Channel == "" {
-		c.Update.Channel = "stable"
+		c.Update.Channel = d.Update.Channel
 	}
 	if c.Update.CheckInterval <= 0 {
-		c.Update.CheckInterval = 3600
+		c.Update.CheckInterval = d.Update.CheckInterval
 	}
 	if c.Update.Source == "" {
-		c.Update.Source = "github"
+		c.Update.Source = d.Update.Source
 	}
 	if c.Update.Repo == "" {
-		c.Update.Repo = "lieyanc/FireGateway"
+		c.Update.Repo = d.Update.Repo
 	}
 	if c.DataDir == "" {
-		c.DataDir = "./data"
+		c.DataDir = d.DataDir
 	}
 	if c.Auth.SessionTTL <= 0 {
-		c.Auth.SessionTTL = DefaultSessionTTL
+		c.Auth.SessionTTL = d.Auth.SessionTTL
 	}
 	if c.Forward == nil {
 		c.Forward = []Rule{}
@@ -138,16 +157,39 @@ func (c *Config) RuleIndex(id RuleID) int {
 	return -1
 }
 
-func parse(data []byte) (*Config, error) {
-	var c Config
-	if err := json.Unmarshal(data, &c); err != nil {
-		return nil, err
-	}
-	if c.Forward == nil {
-		return nil, errors.New("invalid config format: 'forward' array not found")
+// parse decodes data over the defaults, so fields absent from the file keep
+// their default values. incomplete reports whether any were absent.
+func parse(data []byte) (c *Config, incomplete bool, err error) {
+	c = Default()
+	if err := json.Unmarshal(data, c); err != nil {
+		return nil, false, err
 	}
 	c.applyDefaults()
-	return &c, nil
+	var want, have map[string]any
+	if err := json.Unmarshal(template, &want); err != nil {
+		panic("config template: " + err.Error())
+	}
+	if err := json.Unmarshal(data, &have); err != nil {
+		return nil, false, err
+	}
+	return c, missingKeys(want, have), nil
+}
+
+// missingKeys reports whether have lacks (or nulls) any key of want,
+// descending into nested objects.
+func missingKeys(want, have map[string]any) bool {
+	for k, w := range want {
+		h, ok := have[k]
+		if !ok || h == nil {
+			return true
+		}
+		wm, wok := w.(map[string]any)
+		hm, hok := h.(map[string]any)
+		if wok && hok && missingKeys(wm, hm) {
+			return true
+		}
+	}
+	return false
 }
 
 // Store owns the current configuration and its file. All mutations go
@@ -159,22 +201,39 @@ type Store struct {
 	rw   sync.RWMutex
 }
 
-// Open loads path, creating it with defaults when missing. created reports
-// whether a new file was written.
-func Open(path string) (s *Store, created bool, err error) {
-	s = &Store{path: path}
+// OpenState reports what Open did to the config file.
+type OpenState int
+
+const (
+	Loaded    OpenState = iota // read unchanged
+	Created                    // did not exist; written from the template
+	Completed                  // missing fields filled in from the template and saved
+)
+
+// Open loads path. A missing file is created from the template, and a file
+// lacking fields is completed from it and rewritten.
+func Open(path string) (*Store, OpenState, error) {
+	s := &Store{path: path}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		s.cur = Default()
-		return s, true, s.write(s.cur)
+		return s, Created, s.write(s.cur)
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, Loaded, err
 	}
-	if s.cur, err = parse(data); err != nil {
-		return nil, false, err
+	cur, incomplete, err := parse(data)
+	if err != nil {
+		return nil, Loaded, err
 	}
-	return s, false, nil
+	s.cur = cur
+	if !incomplete {
+		return s, Loaded, nil
+	}
+	if err := s.write(cur); err != nil {
+		return nil, Loaded, fmt.Errorf("complete config: %w", err)
+	}
+	return s, Completed, nil
 }
 
 func (s *Store) Path() string { return s.path }
@@ -213,7 +272,7 @@ func (s *Store) Reload() (old, cur *Config, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	next, err := parse(data)
+	next, _, err := parse(data)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -258,19 +317,3 @@ func (s *Store) write(c *Config) error {
 	}
 	return os.Rename(tmp, s.path)
 }
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func BoolOr(b *bool, def bool) bool {
-	if b == nil {
-		return def
-	}
-	return *b
-}
-
-func Bool(b bool) *bool { return &b }

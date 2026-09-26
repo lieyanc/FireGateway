@@ -28,7 +28,7 @@ import (
 const summaryInterval = 5 * time.Minute
 
 func main() {
-	cfgPath := flag.String("c", "config.json", "path to config file (created with defaults if missing)")
+	cfgPath := flag.String("c", "config.json", "path to config file (created or completed from the default template)")
 	showVersion := flag.Bool("v", false, "print version and exit")
 	resetAuth := flag.Bool("reset-auth", false, "remove the admin account and API tokens, then exit")
 	flag.Parse()
@@ -38,7 +38,7 @@ func main() {
 	}
 
 	start := time.Now()
-	store, created, err := config.Open(*cfgPath)
+	store, state, err := config.Open(*cfgPath)
 	if err != nil {
 		slog.Error("configuration error", "configPath", *cfgPath, "err", err,
 			"suggestion", "fix the file, or remove it to start with defaults")
@@ -58,8 +58,11 @@ func main() {
 		slog.Error("failed to set up logging", "err", err)
 		os.Exit(1)
 	}
-	if created {
-		slog.Info("no config file found, created one with defaults", "configPath", *cfgPath)
+	switch state {
+	case config.Created:
+		slog.Info("no config file found, created one from the default template", "configPath", *cfgPath)
+	case config.Completed:
+		slog.Info("config file was missing fields, filled them in with defaults", "configPath", *cfgPath)
 	}
 	slog.Info("configuration loaded", "version", version.Version, "configPath", *cfgPath, "rules", len(cfg.Forward))
 
@@ -112,7 +115,7 @@ func main() {
 	})
 	upd.StartBackground(ctx)
 
-	if config.BoolOr(cfg.API.Enabled, true) {
+	if cfg.API.Enabled {
 		srv, err = api.Start(api.Deps{
 			Store: store, Manager: mgr, Sampler: sampler, Broker: broker, Auth: authSvc, Updater: upd,
 			Started: start, Web: web.FS(),

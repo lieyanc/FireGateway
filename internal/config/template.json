@@ -1,0 +1,29 @@
+{
+  "api": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8080,
+    "enableCors": false
+  },
+  "auth": {
+    "sessionTtl": 604800
+  },
+  "logging": {
+    "level": "info",
+    "enableFile": false,
+    "enableConsole": true,
+    "logDir": "./logs",
+    "maxFileSize": 10485760,
+    "maxFiles": 5
+  },
+  "update": {
+    "enabled": false,
+    "channel": "stable",
+    "checkInterval": 3600,
+    "source": "github",
+    "proxyBaseUrl": "",
+    "repo": "lieyanc/FireGateway"
+  },
+  "dataDir": "./data",
+  "forward": []
+}
