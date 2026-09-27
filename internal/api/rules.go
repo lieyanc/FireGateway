@@ -1,12 +1,17 @@
 package api
 
 import (
+	"errors"
+	"io/fs"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/lieyanc/FireGateway/internal/config"
 	"github.com/lieyanc/FireGateway/internal/gateway"
+	"github.com/lieyanc/FireGateway/internal/importer"
 	"github.com/lieyanc/FireGateway/internal/metrics"
 	"github.com/lieyanc/FireGateway/internal/proxy"
 )
@@ -163,6 +168,70 @@ func (s *Server) importRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// rinetdPaths are where the one-click import looks for this host's rinetd config.
+var rinetdPaths = []string{"/etc/rinetd.conf", "/usr/local/etc/rinetd.conf", "/opt/homebrew/etc/rinetd.conf"}
+
+// importedRule returns ids as strings like ruleView; empty ids are assigned on import.
+type importedRule struct {
+	ID string `json:"id"`
+	config.Rule
+}
+
+type importPreview struct {
+	Path     string             `json:"path,omitempty"`
+	Format   string             `json:"format"`
+	Rules    []importedRule     `json:"rules"`
+	Warnings []importer.Warning `json:"warnings"`
+}
+
+func previewOf(res *importer.Result, path string) importPreview {
+	p := importPreview{Path: path, Format: res.Format, Rules: make([]importedRule, len(res.Rules)), Warnings: res.Warnings}
+	for i, r := range res.Rules {
+		p.Rules[i] = importedRule{ID: string(r.ID), Rule: r}
+	}
+	return p
+}
+
+// parseImport converts rinetd or FireProxy text into rules without applying
+// them; the client reviews the result and submits it to importRules.
+func (s *Server) parseImport(w http.ResponseWriter, r *http.Request) {
+	var b struct {
+		Format string `json:"format"`
+		Text   string `json:"text"`
+	}
+	if !decode(w, r, &b, 4<<20) {
+		return
+	}
+	res, err := importer.Parse(b.Format, b.Text)
+	if err != nil {
+		failErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, previewOf(res, ""))
+}
+
+// localRinetd reads and converts the rinetd config on this host.
+func (s *Server) localRinetd(w http.ResponseWriter, _ *http.Request) {
+	for _, path := range rinetdPaths {
+		data, err := os.ReadFile(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			fail(w, http.StatusInternalServerError, "read_failed", err.Error())
+			return
+		}
+		res, err := importer.Parse(importer.FormatRinetd, string(data))
+		if err != nil {
+			failErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, previewOf(res, path))
+		return
+	}
+	fail(w, http.StatusNotFound, "not_found", "no rinetd config found (looked for "+strings.Join(rinetdPaths, ", ")+")")
 }
 
 func (s *Server) reloadConfig(w http.ResponseWriter, _ *http.Request) {

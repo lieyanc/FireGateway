@@ -90,6 +90,8 @@ func (s *Server) routes() http.Handler {
 	h("POST /api/rules", s.createRule)
 	h("GET /api/rules/export", s.exportRules)
 	h("POST /api/rules/import", s.importRules)
+	h("POST /api/rules/import/parse", s.parseImport)
+	h("GET /api/rules/import/rinetd", s.localRinetd)
 	h("POST /api/rules/batch", s.batchRules)
 	h("GET /api/rules/{id}", s.getRule)
 	h("PUT /api/rules/{id}", s.updateRule)

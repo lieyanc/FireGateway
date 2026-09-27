@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -158,6 +159,40 @@ func TestRulesAPI(t *testing.T) {
 	code, out = h.do(t, "PUT", "/api/settings", `{"api":{"host":"0.0.0.0","port":9000,"enableCors":false}}`)
 	if code != 200 || out["restartRequired"] != true {
 		t.Fatalf("settings: %d %v", code, out)
+	}
+}
+
+func TestImportParseAPI(t *testing.T) {
+	h := newHarness(t)
+	h.setup(t)
+	code, out := h.do(t, "POST", "/api/rules/import/parse", `{"format":"auto","text":"0.0.0.0 18081 127.0.0.1 80\nallow 10.*\n0.0.0.0 x h 1\n"}`)
+	rules, _ := out["rules"].([]any)
+	warnings, _ := out["warnings"].([]any)
+	if code != 200 || out["format"] != "rinetd" || len(rules) != 1 || len(warnings) != 1 {
+		t.Fatalf("parse: %d %v", code, out)
+	}
+	if r := rules[0].(map[string]any); r["id"] != "" || r["localPort"] != float64(18081) || r["acl"] == nil {
+		t.Fatalf("parsed rule: %v", r)
+	}
+	if code, out := h.do(t, "POST", "/api/rules/import/parse", `{"format":"json","text":"{\"api\":{}}"}`); code != 400 || out["field"] != "text" {
+		t.Fatalf("parse error: %d %v", code, out)
+	}
+
+	dir := t.TempDir()
+	saved := rinetdPaths
+	t.Cleanup(func() { rinetdPaths = saved })
+	rinetdPaths = []string{filepath.Join(dir, "missing.conf")}
+	if code, _ := h.do(t, "GET", "/api/rules/import/rinetd", ""); code != 404 {
+		t.Fatalf("missing rinetd config: %d", code)
+	}
+	conf := filepath.Join(dir, "rinetd.conf")
+	if err := os.WriteFile(conf, []byte("0.0.0.0 18082/udp 127.0.0.1 53/udp\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rinetdPaths = append(rinetdPaths, conf)
+	code, out = h.do(t, "GET", "/api/rules/import/rinetd", "")
+	if code != 200 || out["path"] != conf || len(out["rules"].([]any)) != 1 {
+		t.Fatalf("local rinetd: %d %v", code, out)
 	}
 }
 

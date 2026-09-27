@@ -101,6 +101,24 @@ export type BatchResult = {
 
 export type ImportMode = "merge" | "replace"
 
+/** Input format for the import parser; "json" covers FireGateway and FireProxy. */
+export type ImportFormat = "auto" | "json" | "rinetd"
+
+/** Something skipped or changed while converting; `line` for rinetd, `index` (1-based rule) for JSON. */
+export type ImportWarning = {
+  line?: number
+  index?: number
+  message: string
+}
+
+/** Converted rules awaiting review; ids may be empty (assigned on import). */
+export type ImportPreview = {
+  path?: string
+  format: Exclude<ImportFormat, "auto">
+  rules: Rule[]
+  warnings: ImportWarning[]
+}
+
 export type ChangeSummary = {
   added: number
   updated: number

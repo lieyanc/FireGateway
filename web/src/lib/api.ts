@@ -6,7 +6,9 @@ import type {
   BatchResult,
   ChangeSummary,
   Connection,
+  ImportFormat,
   ImportMode,
+  ImportPreview,
   LogEntry,
   LogLevelInfo,
   MetricRange,
@@ -176,6 +178,9 @@ export const api = {
     export: () => get<{ forward: Rule[] }>("/api/rules/export"),
     import: (forward: Rule[], mode: ImportMode) =>
       post<ChangeSummary>("/api/rules/import", { forward, mode }),
+    parseImport: (text: string, format: ImportFormat) =>
+      post<ImportPreview>("/api/rules/import/parse", { text, format }),
+    localRinetd: () => get<ImportPreview>("/api/rules/import/rinetd"),
   },
   connections: {
     list: (rule?: string, signal?: AbortSignal) =>
