@@ -5,11 +5,13 @@ import (
 	"crypto/rand"
 	"io"
 	"net"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/lieyanc/FireGateway/internal/config"
+	"github.com/lieyanc/FireGateway/internal/dnscache"
 )
 
 func freePort(t *testing.T) int {
@@ -310,5 +312,232 @@ func BenchmarkTCPThroughput(b *testing.B) {
 		if _, err := c.Write(buf); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// BenchmarkUDPEcho pushes 1200-byte datagrams (WireGuard/game sized) through
+// the forwarder to an echo target with a bounded in-flight window, measuring
+// round-trip packet throughput. Lost datagrams reopen the window on timeout.
+func BenchmarkUDPEcho(b *testing.B) {
+	echo, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	defer echo.Close()
+	echo.SetReadBuffer(4 << 20)
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, a, err := echo.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				return
+			}
+			echo.WriteToUDPAddrPort(buf[:n], a)
+		}
+	}()
+	lp := freeUDPPort(b)
+	rn, err := Start(&config.Rule{ID: "b", Type: "udp", Status: "active", LocalHost: "127.0.0.1", LocalPort: lp,
+		TargetHost: "127.0.0.1", TargetPort: echo.LocalAddr().(*net.UDPAddr).Port})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer rn.Stop()
+	c, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: lp})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer c.Close()
+	c.SetReadBuffer(4 << 20)
+
+	const window = 128
+	pkt := make([]byte, 1200)
+	credit := make(chan struct{}, window)
+	for range window {
+		credit <- struct{}{}
+	}
+	done := make(chan struct{})
+	lost := 0
+	go func() {
+		defer close(done)
+		buf := make([]byte, 2048)
+		for got := 0; got+lost < b.N; {
+			c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			if _, err := c.Read(buf); err != nil {
+				// Treat whatever is still in flight as lost.
+				inflight := window - len(credit)
+				lost += inflight
+				for range inflight {
+					credit <- struct{}{}
+				}
+				continue
+			}
+			got++
+			credit <- struct{}{}
+		}
+	}()
+	b.SetBytes(int64(len(pkt)))
+	b.ResetTimer()
+	for range b.N {
+		<-credit
+		c.Write(pkt)
+	}
+	<-done
+	b.ReportMetric(float64(lost), "lost")
+}
+
+func freeUDPPort(tb testing.TB) int {
+	tb.Helper()
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer c.Close()
+	return c.LocalAddr().(*net.UDPAddr).Port
+}
+
+func udpEcho(t *testing.T, network string, ip net.IP) int {
+	t.Helper()
+	echo, err := net.ListenUDP(network, &net.UDPAddr{IP: ip})
+	if err != nil {
+		t.Skip("cannot listen:", err)
+	}
+	t.Cleanup(func() { echo.Close() })
+	echo.SetReadBuffer(8 << 20)
+	echo.SetWriteBuffer(8 << 20)
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, a, err := echo.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				return
+			}
+			echo.WriteToUDPAddrPort(buf[:n], a)
+		}
+	}()
+	return echo.LocalAddr().(*net.UDPAddr).Port
+}
+
+// A burst exercises the batched drain and send paths in both directions,
+// including datagrams near the maximum size.
+func TestUDPBurst(t *testing.T) {
+	ep := udpEcho(t, "udp4", net.IPv4(127, 0, 0, 1))
+	lp := freeUDPPort(t)
+	rn, err := Start(&config.Rule{ID: "u", Type: "udp", Status: "active", LocalHost: "127.0.0.1", LocalPort: lp,
+		TargetHost: "127.0.0.1", TargetPort: ep})
+	if err != nil || rn.Listeners() != 1 {
+		t.Fatalf("start: %v %v", err, rn.Failures())
+	}
+	defer rn.Stop()
+	c, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: lp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetReadBuffer(8 << 20)
+
+	sizes := []int{1, 1200, 60000, 512, 65507, 9000}
+	want := map[string]int{}
+	total := 0
+	const rounds = 20
+	for i := range rounds * len(sizes) {
+		p := make([]byte, sizes[i%len(sizes)])
+		rand.Read(p)
+		want[string(p)]++
+		total += len(p)
+		if _, err := c.Write(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	buf := make([]byte, 65536)
+	for range rounds * len(sizes) {
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := c.Read(buf)
+		if err != nil {
+			t.Fatalf("read: %v (%d datagrams missing)", err, len(want))
+		}
+		k := string(buf[:n])
+		if want[k] == 0 {
+			t.Fatalf("unexpected or corrupted datagram of %d bytes", n)
+		}
+		if want[k]--; want[k] == 0 {
+			delete(want, k)
+		}
+	}
+	waitFor(t, "counters", func() bool {
+		s := rn.Snapshot()
+		return s.Messages == int64(rounds*len(sizes)) && s.BytesUp == int64(total) && s.BytesDn == int64(total)
+	})
+}
+
+// A dual-stack listener must answer IPv4 clients (v4-mapped on the socket)
+// on the batched reply path too.
+func TestUDPDualStack(t *testing.T) {
+	ep := udpEcho(t, "udp4", net.IPv4(127, 0, 0, 1))
+	probe, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv6unspecified})
+	if err != nil {
+		t.Skip("no IPv6:", err)
+	}
+	lp := probe.LocalAddr().(*net.UDPAddr).Port
+	probe.Close()
+	rn, err := Start(&config.Rule{ID: "u", Type: "udp", Status: "active", LocalHost: "::", LocalPort: lp,
+		TargetHost: "127.0.0.1", TargetPort: ep})
+	if err != nil || rn.Listeners() != 1 {
+		t.Fatalf("start: %v %v", err, rn.Failures())
+	}
+	defer rn.Stop()
+	c, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: lp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const n = 200
+	for i := range n {
+		c.Write([]byte(strconv.Itoa(i)))
+	}
+	buf := make([]byte, 64)
+	for i := range n {
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Read(buf); err != nil {
+			t.Fatalf("reply %d: %v", i, err)
+		}
+	}
+}
+
+// Hostname targets resolve through the DNS cache; "localhost" may list ::1
+// first, which the TCP dialer must skip past when nothing listens there.
+func TestTCPHostnameTarget(t *testing.T) {
+	_, addr := startTCPRule(t, func(r *config.Rule) { r.TargetHost = "localhost" })
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write([]byte("ping"))
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 4)
+	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "ping" {
+		t.Fatalf("echo via hostname: %q, %v", buf, err)
+	}
+}
+
+// Hot-swapping the target host moves the rule's DNS cache reference.
+func TestApplyMovesDNSReference(t *testing.T) {
+	cached := func(host string) bool {
+		return slices.ContainsFunc(dnscache.Default.Entries(), func(e dnscache.Entry) bool { return e.Host == host })
+	}
+	rn, _ := startTCPRule(t, func(r *config.Rule) { r.TargetHost = "localhost" })
+	if !cached("localhost") {
+		t.Fatal("hostname target not cached after start")
+	}
+	rule := &config.Rule{ID: "t", Type: "tcp", Status: "active", LocalHost: "127.0.0.1", LocalPort: 1,
+		TargetHost: "127.0.0.1", TargetPort: 1}
+	if err := rn.Apply(rule); err != nil {
+		t.Fatal(err)
+	}
+	if cached("localhost") {
+		t.Fatal("old hostname still cached after switching to an IP target")
+	}
+	rule.TargetHost = "localhost"
+	rn.Apply(rule)
+	rn.Stop()
+	if cached("localhost") {
+		t.Fatal("hostname still cached after stop")
 	}
 }

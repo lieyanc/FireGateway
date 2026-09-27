@@ -141,6 +141,33 @@ export type Connection = {
   bytesDown: number
 }
 
+// ---- DNS ----
+
+export type DnsRuleRef = {
+  id: string
+  name: string
+}
+
+export type DnsEntry = {
+  host: string
+  addrs: string[]
+  error?: string
+  /** First lookup still in flight. */
+  pending: boolean
+  resolvedAt: string
+  checkedAt: string
+  nextAt: string
+  rules: DnsRuleRef[]
+}
+
+export type DnsCache = {
+  /** Seconds between refreshes of a successful answer. */
+  ttl: number
+  /** Seconds before a failed lookup is retried. */
+  retryInterval: number
+  items: DnsEntry[]
+}
+
 // ---- Logs ----
 
 export type LogLevel = "ERROR" | "WARN" | "INFO" | "DEBUG" | "TRACE"

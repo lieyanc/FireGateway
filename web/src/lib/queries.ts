@@ -38,6 +38,7 @@ export const qk = {
     ["metrics", "history", range, rule ?? "all"] as const,
   top: (range: MetricRange) => ["metrics", "top", range] as const,
   logLevel: ["logs", "level"] as const,
+  dns: ["dns"] as const,
   settings: ["settings"] as const,
   updateStatus: ["update", "status"] as const,
 }
@@ -124,6 +125,14 @@ export function useTopRules(range: MetricRange) {
     queryFn: async () => (await api.metrics.top(range)).items,
     placeholderData: keepPreviousData,
     refetchInterval: 60_000,
+  })
+}
+
+export function useDnsCache() {
+  return useQuery({
+    queryKey: qk.dns,
+    queryFn: api.dns.list,
+    refetchInterval: 10_000,
   })
 }
 

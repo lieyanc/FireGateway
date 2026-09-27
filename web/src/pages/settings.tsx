@@ -1,6 +1,7 @@
 import { useNavigate, useParams } from "react-router"
 import {
   DownloadIcon,
+  GlobeIcon,
   InfoIcon,
   KeyRoundIcon,
   ServerIcon,
@@ -12,18 +13,20 @@ import { PageContainer, PageHeader } from "@/components/common/page-header"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { AboutTab } from "@/features/settings/about-tab"
 import { AccountTab } from "@/features/settings/account-tab"
+import { DnsTab } from "@/features/settings/dns-tab"
 import { RestartBanner } from "@/features/settings/restart-banner"
 import { SystemTab } from "@/features/settings/system-tab"
 import { TokensTab } from "@/features/settings/tokens-tab"
 import { UpdateTab } from "@/features/settings/update-tab"
 import { useI18n } from "@/i18n"
 
-type Tab = "account" | "tokens" | "system" | "update" | "about"
+type Tab = "account" | "tokens" | "system" | "dns" | "update" | "about"
 
 const TABS: { value: Tab; icon: LucideIcon; Content: () => React.ReactNode }[] = [
   { value: "account", icon: UserIcon, Content: AccountTab },
   { value: "tokens", icon: KeyRoundIcon, Content: TokensTab },
   { value: "system", icon: ServerIcon, Content: SystemTab },
+  { value: "dns", icon: GlobeIcon, Content: DnsTab },
   { value: "update", icon: DownloadIcon, Content: UpdateTab },
   { value: "about", icon: InfoIcon, Content: AboutTab },
 ]

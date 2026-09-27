@@ -109,6 +109,9 @@ func (s *Server) routes() http.Handler {
 	h("GET /api/metrics/history", s.metricsHistory)
 	h("GET /api/metrics/top", s.metricsTop)
 
+	h("GET /api/dns", s.listDNS)
+	h("POST /api/dns/refresh", s.refreshDNS)
+
 	h("GET /api/events", s.events)
 	h("GET /api/logs", s.logs)
 	h("GET /api/logs/stream", s.logStream)

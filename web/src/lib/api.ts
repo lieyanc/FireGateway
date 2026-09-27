@@ -6,6 +6,8 @@ import type {
   BatchResult,
   ChangeSummary,
   Connection,
+  DnsCache,
+  DnsEntry,
   ImportFormat,
   ImportMode,
   ImportPreview,
@@ -188,6 +190,12 @@ export const api = {
     close: (id: string) => del<void>(`/api/connections/${enc(id)}`),
     closeForRule: (rule: string) =>
       del<{ closed: number }>("/api/connections", { rule }),
+  },
+  dns: {
+    list: () => get<DnsCache>("/api/dns"),
+    /** Re-resolves one host, or every cached host when omitted. */
+    refresh: (host?: string) =>
+      post<{ items: DnsEntry[] }>("/api/dns/refresh", { host }),
   },
   metrics: {
     realtime: (rule?: string) =>

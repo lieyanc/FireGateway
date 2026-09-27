@@ -13,7 +13,7 @@ const (
 	tcpKeepAlive   = 15 * time.Second
 )
 
-var tcpDialer = net.Dialer{Timeout: tcpDialTimeout, KeepAlive: tcpKeepAlive}
+var tcpDialer = net.Dialer{KeepAlive: tcpKeepAlive}
 
 type tcpListener struct {
 	rn   *Runner
@@ -58,7 +58,8 @@ func (l *tcpListener) serve() {
 
 func (l *tcpListener) handle(client *net.TCPConn) {
 	r := l.rn
-	target := r.target(l.idx)
+	p := r.policy()
+	target := p.targets[l.idx]
 	var upstream atomic.Pointer[net.TCPConn]
 	c := r.admit(client.RemoteAddr().(*net.TCPAddr).AddrPort(), l.addr, target, func() {
 		client.Close()
@@ -73,7 +74,7 @@ func (l *tcpListener) handle(client *net.TCPConn) {
 	defer r.release(c)
 	defer c.Close()
 
-	tc, err := tcpDialer.DialContext(c.ctx, "tcp", target)
+	up, err := dialTCP(c.ctx, p, l.idx)
 	if err != nil {
 		if c.ctx.Err() == nil {
 			r.errors.Add(1)
@@ -83,13 +84,16 @@ func (l *tcpListener) handle(client *net.TCPConn) {
 	}
 	// Close cancels ctx before loading upstream, so either it sees the
 	// socket or we see the cancellation here.
-	up := tc.(*net.TCPConn)
 	upstream.Store(up)
 	if c.ctx.Err() != nil {
 		up.Close()
 		return
 	}
-	r.log.Debug("TCP connection established", "client", c.client.String(), "target", target)
+	debug := r.debugOn()
+	if debug {
+		r.log.Debug("TCP connection established", "client", c.client.String(), "target", target,
+			"remote", up.RemoteAddr().String())
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -98,8 +102,10 @@ func (l *tcpListener) handle(client *net.TCPConn) {
 	}()
 	pipe(c, client, up, false)
 	<-done
-	r.log.Debug("TCP connection closed", "client", c.client.String(),
-		"bytesUp", c.up.Load(), "bytesDown", c.down.Load())
+	if debug {
+		r.log.Debug("TCP connection closed", "client", c.client.String(),
+			"bytesUp", c.up.Load(), "bytesDown", c.down.Load())
+	}
 }
 
 // pipe copies src to dst. A clean EOF is propagated as a half-close; an error
@@ -112,7 +118,9 @@ func pipe(c *Conn, dst, src *net.TCPConn, up bool) {
 		}
 	} else if !errors.Is(err, net.ErrClosed) && c.ctx.Err() == nil {
 		c.runner.errors.Add(1)
-		c.runner.log.Debug("TCP pipe error", "client", c.client.String(), "err", err)
+		if c.runner.debugOn() {
+			c.runner.log.Debug("TCP pipe error", "client", c.client.String(), "err", err)
+		}
 	}
 	c.Close()
 }

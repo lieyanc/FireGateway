@@ -6,7 +6,8 @@ Lightweight TCP/UDP port forwarding manager written in Go, with a built-in web U
 
 ## Features
 
-- **Forwarding**: TCP and UDP, single ports or one-to-one port ranges, IPv4/IPv6. TCP uses `splice(2)` on Linux (zero-copy) with half-close propagation; UDP keeps one upstream socket per client with idle reaping.
+- **Forwarding**: TCP and UDP, single ports or one-to-one port ranges, IPv4/IPv6. TCP uses `splice(2)` on Linux (zero-copy) with half-close propagation; UDP keeps one upstream socket per client with idle reaping, and on Linux moves queued datagrams in batches (`recvmmsg`/`sendmmsg`), which suits WireGuard and game traffic.
+- **DNS cache**: hostname targets are resolved in the background and re-resolved every minute, so new connections never wait for DNS. If a lookup fails, the last good addresses stay in use. The cache can be inspected and refreshed from the UI (Settings → DNS).
 - **Hot changes**: create, edit, enable/disable and delete rules at runtime. Changing only the target, ACL, limits or name keeps listeners and live connections; changing listen address/ports re-binds just that rule.
 - **Access control & limits** per rule: IP/CIDR allow- or deny-list, max concurrent connections (total and per source IP), bandwidth limit per direction.
 - **Live monitoring**: per-rule counters and rates pushed over Server-Sent Events every second, live connection list with the ability to close connections, traffic history (1h / 24h / 7d / 30d) persisted across restarts.
@@ -116,6 +117,7 @@ Layout:
 cmd/firegateway     entrypoint
 internal/config     config model, validation, atomic store
 internal/proxy      TCP/UDP forwarding engine (splice, ACL, limits, connection tracking)
+internal/dnscache   background-refreshed resolution of hostname targets
 internal/gateway    rule lifecycle and hot reconciliation
 internal/metrics    1s sampler, realtime/minute/hour series, persistence
 internal/auth       admin login, sessions, API tokens

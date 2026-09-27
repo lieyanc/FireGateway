@@ -18,12 +18,15 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/lieyanc/FireGateway/internal/config"
+	"github.com/lieyanc/FireGateway/internal/dnscache"
 )
 
 // policy is the part of a rule that can change without re-binding.
 type policy struct {
 	name      string
-	targets   []string // indexed by mapping
+	host      string   // target host, resolved through dnscache
+	ports     []int    // target port per mapping
+	targets   []string // host:port per mapping, for display
 	aclAllow  bool     // allow-list when true, deny-list when false
 	acl       []netip.Prefix
 	maxConns  int
@@ -34,9 +37,11 @@ type policy struct {
 }
 
 func newPolicy(r *config.Rule, mappings []config.Mapping) *policy {
-	p := &policy{name: r.Name, chunk: maxChunk}
+	p := &policy{name: r.Name, host: r.TargetHost, chunk: maxChunk}
+	p.ports = make([]int, len(mappings))
 	p.targets = make([]string, len(mappings))
 	for i, m := range mappings {
+		p.ports[i] = m.Target
 		p.targets[i] = net.JoinHostPort(r.TargetHost, strconv.Itoa(m.Target))
 	}
 	if r.ACL != nil {
@@ -108,8 +113,11 @@ type Runner struct {
 	mu    sync.Mutex
 	conns map[uint64]*Conn
 	perIP map[netip.Addr]int
+	// Bytes of released connections. Live ones are summed on Snapshot, so
+	// the copy loops never write to counters shared across connections.
+	closedUp, closedDn int64
 
-	total, errors, rejected, messages, bytesUp, bytesDn atomic.Int64
+	total, errors, rejected, messages atomic.Int64
 }
 
 // Start binds every mapping of r. Bind failures are recorded, not fatal, so a
@@ -132,6 +140,7 @@ func Start(r *config.Rule) (*Runner, error) {
 		perIP:  make(map[netip.Addr]int),
 	}
 	rn.pol.Store(newPolicy(r, mappings))
+	dnscache.Default.Acquire(r.TargetHost)
 	for i, m := range mappings {
 		addr := net.JoinHostPort(r.LocalHost, strconv.Itoa(m.Local))
 		var (
@@ -162,7 +171,10 @@ func (r *Runner) Apply(rule *config.Rule) error {
 		return err
 	}
 	p := newPolicy(rule, mappings)
-	r.pol.Store(p)
+	if old := r.pol.Swap(p); old.host != p.host {
+		dnscache.Default.Acquire(p.host)
+		dnscache.Default.Release(old.host)
+	}
 	var denied []*Conn
 	r.mu.Lock()
 	for _, c := range r.conns {
@@ -187,28 +199,32 @@ func (r *Runner) Stop() {
 		l.Close()
 	}
 	r.CloseAll()
+	dnscache.Default.Release(r.policy().host)
 	r.log.Info("rule stopped")
 }
 
-func (r *Runner) Listeners() int        { return len(r.listeners) }
-func (r *Runner) Failures() []Failure   { return r.failures }
-func (r *Runner) policy() *policy       { return r.pol.Load() }
-func (r *Runner) Name() string          { return r.policy().name }
-func (r *Runner) target(idx int) string { return r.policy().targets[idx] }
+func (r *Runner) Listeners() int      { return len(r.listeners) }
+func (r *Runner) Failures() []Failure { return r.failures }
+func (r *Runner) policy() *policy     { return r.pol.Load() }
+func (r *Runner) Name() string        { return r.policy().name }
+
+// debugOn reports whether debug logs are emitted, so hot paths can skip
+// building their arguments.
+func (r *Runner) debugOn() bool { return r.log.Enabled(context.Background(), slog.LevelDebug) }
 
 func (r *Runner) Snapshot() Snapshot {
 	r.mu.Lock()
-	active := len(r.conns)
-	r.mu.Unlock()
-	return Snapshot{
-		Active:   int64(active),
-		Total:    r.total.Load(),
-		BytesUp:  r.bytesUp.Load(),
-		BytesDn:  r.bytesDn.Load(),
-		Errors:   r.errors.Load(),
-		Rejected: r.rejected.Load(),
-		Messages: r.messages.Load(),
+	s := Snapshot{Active: int64(len(r.conns)), BytesUp: r.closedUp, BytesDn: r.closedDn}
+	for _, c := range r.conns {
+		s.BytesUp += c.up.Load()
+		s.BytesDn += c.down.Load()
 	}
+	r.mu.Unlock()
+	s.Total = r.total.Load()
+	s.Errors = r.errors.Load()
+	s.Rejected = r.rejected.Load()
+	s.Messages = r.messages.Load()
+	return s
 }
 
 var connSeq atomic.Uint64
@@ -220,7 +236,9 @@ func (r *Runner) admit(client netip.AddrPort, listen, target string, closeFn fun
 	ip := client.Addr().Unmap()
 	if !p.allowed(ip) {
 		r.rejected.Add(1)
-		r.log.Debug("connection denied by ACL", "client", client.String())
+		if r.debugOn() {
+			r.log.Debug("connection denied by ACL", "client", client.String())
+		}
 		return nil
 	}
 	now := time.Now()
@@ -237,13 +255,17 @@ func (r *Runner) admit(client netip.AddrPort, listen, target string, closeFn fun
 		r.mu.Unlock()
 		c.cancel()
 		r.rejected.Add(1)
-		r.log.Debug("connection refused: rule connection limit", "client", client.String(), "limit", p.maxConns)
+		if r.debugOn() {
+			r.log.Debug("connection refused: rule connection limit", "client", client.String(), "limit", p.maxConns)
+		}
 		return nil
 	case p.maxPerIP > 0 && r.perIP[ip] >= p.maxPerIP:
 		r.mu.Unlock()
 		c.cancel()
 		r.rejected.Add(1)
-		r.log.Debug("connection refused: per-IP limit", "client", client.String(), "limit", p.maxPerIP)
+		if r.debugOn() {
+			r.log.Debug("connection refused: per-IP limit", "client", client.String(), "limit", p.maxPerIP)
+		}
 		return nil
 	}
 	r.conns[c.id] = c
@@ -258,6 +280,8 @@ func (r *Runner) release(c *Conn) {
 	r.mu.Lock()
 	if _, ok := r.conns[c.id]; ok {
 		delete(r.conns, c.id)
+		r.closedUp += c.up.Load()
+		r.closedDn += c.down.Load()
 		if r.perIP[ip]--; r.perIP[ip] <= 0 {
 			delete(r.perIP, ip)
 		}
@@ -356,11 +380,9 @@ func (c *Conn) account(n int, up bool) error {
 	lim := p.limitDown
 	if up {
 		c.up.Add(int64(n))
-		c.runner.bytesUp.Add(int64(n))
 		lim = p.limitUp
 	} else {
 		c.down.Add(int64(n))
-		c.runner.bytesDn.Add(int64(n))
 	}
 	if lim == nil {
 		return nil
