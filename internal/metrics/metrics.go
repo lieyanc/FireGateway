@@ -223,11 +223,11 @@ func (s *Sampler) sample(now time.Time, elapsed float64) {
 
 		c := CountersOf(snap, st.rateUp, st.rateDown)
 		ev.Totals.Add(c)
-		ev.Rules[r.ID] = ruleStats{c, s.mgr.Runtime(r).State}
+		ev.Rules[r.ID] = ruleStats{c, s.mgr.State(r)}
 	}
 	// Forget deleted rules.
 	for id := range s.rules {
-		if cfg.RuleIndex(id) < 0 {
+		if _, ok := ev.Rules[id]; !ok {
 			delete(s.rules, id)
 		}
 	}

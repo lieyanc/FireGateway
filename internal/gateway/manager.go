@@ -150,7 +150,12 @@ type Runtime struct {
 	Snapshot  proxy.Snapshot
 }
 
-func (m *Manager) Runtime(r *config.Rule) Runtime {
+func (m *Manager) Runtime(r *config.Rule) Runtime { return m.runtime(r, true) }
+
+// State returns the rule's run state without sampling its counters.
+func (m *Manager) State(r *config.Rule) string { return m.runtime(r, false).State }
+
+func (m *Manager) runtime(r *config.Rule, withSnapshot bool) Runtime {
 	if !r.Active() {
 		return Runtime{State: StateStopped}
 	}
@@ -165,7 +170,10 @@ func (m *Manager) Runtime(r *config.Rule) Runtime {
 	}
 	rt := Runtime{
 		Listeners: rn.Listeners(), Failures: rn.Failures(),
-		StartedAt: rn.StartedAt, Snapshot: rn.Snapshot(), State: StateRunning,
+		StartedAt: rn.StartedAt, State: StateRunning,
+	}
+	if withSnapshot {
+		rt.Snapshot = rn.Snapshot()
 	}
 	switch {
 	case rt.Listeners == 0:

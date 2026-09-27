@@ -13,15 +13,25 @@ import (
 const (
 	spliceMove     = 0x1
 	spliceNonblock = 0x2
-	fSetPipeSz     = 1031 // F_SETPIPE_SZ
-	pipeSize       = maxChunk
+	fGetPipeSz     = 1032 // F_GETPIPE_SZ
+	// pipeSize is the kernel default. Pipes are left at it rather than
+	// enlarged: the kernel charges pipe capacity to the user even while the
+	// pipe is empty, and once an unprivileged user passes
+	// fs.pipe-user-pages-soft (64 MiB by default) new pipes shrink to two
+	// pages. Larger pipes gain little throughput but reach that limit sooner.
+	pipeSize = 64 << 10
 )
 
-type spipe struct{ r, w int }
+type spipe struct {
+	r, w int
+	// shrunk is set when the pipe was created below the default capacity
+	// (the user was over the pipe quota); such pipes are not pooled.
+	shrunk bool
+}
 
 // pipePool reuses pipes across connections; a bounded channel rather than a
 // sync.Pool because dropped pipes would leak their file descriptors.
-var pipePool = make(chan *spipe, 128)
+var pipePool = make(chan *spipe, 64)
 
 func getPipe() (*spipe, error) {
 	select {
@@ -33,13 +43,12 @@ func getPipe() (*spipe, error) {
 	if err := syscall.Pipe2(fds[:], syscall.O_CLOEXEC|syscall.O_NONBLOCK); err != nil {
 		return nil, err
 	}
-	// Best effort: a larger pipe means fewer syscalls per megabyte.
-	syscall.Syscall(syscall.SYS_FCNTL, uintptr(fds[1]), fSetPipeSz, pipeSize)
-	return &spipe{fds[0], fds[1]}, nil
+	n, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fds[1]), fGetPipeSz, 0)
+	return &spipe{r: fds[0], w: fds[1], shrunk: errno != 0 || int(n) < pipeSize}, nil
 }
 
 func putPipe(p *spipe, clean bool) {
-	if clean {
+	if clean && !p.shrunk {
 		select {
 		case pipePool <- p:
 			return
