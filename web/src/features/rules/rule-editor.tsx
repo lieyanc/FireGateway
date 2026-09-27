@@ -1,7 +1,7 @@
 /* eslint-disable react-refresh/only-export-components */
 import * as React from "react"
 
-import { RuleFormSheet, type RuleEditorTarget } from "@/features/rules/rule-form-sheet"
+import { RuleFormDialog, type RuleEditorTarget } from "@/features/rules/rule-form-dialog"
 import type { Rule, RuleView } from "@/lib/types"
 
 type RuleEditorContextValue = {
@@ -12,7 +12,7 @@ type RuleEditorContextValue = {
 
 const RuleEditorContext = React.createContext<RuleEditorContextValue | null>(null)
 
-/** Hosts one rule form sheet that any descendant can open. */
+/** Hosts one rule form dialog that any descendant can open. */
 export function RuleEditorProvider({
   children,
   onSaved,
@@ -34,7 +34,7 @@ export function RuleEditorProvider({
   return (
     <RuleEditorContext.Provider value={value}>
       {children}
-      <RuleFormSheet
+      <RuleFormDialog
         target={target}
         onOpenChange={(open) => !open && setTarget(null)}
         onSaved={onSaved}

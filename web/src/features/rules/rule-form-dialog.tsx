@@ -13,6 +13,14 @@ import { toast } from "sonner"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
   Field,
   FieldContent,
   FieldDescription,
@@ -37,14 +45,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetFooter,
-  SheetHeader,
-  SheetTitle,
-} from "@/components/ui/sheet"
 import { Spinner } from "@/components/ui/spinner"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
@@ -73,7 +73,7 @@ export type RuleEditorTarget =
 const HOST_PICKS = ["0.0.0.0", "127.0.0.1", "::"]
 const FORM_ID = "rule-form"
 
-export function RuleFormSheet({
+export function RuleFormDialog({
   target,
   onOpenChange,
   onSaved,
@@ -84,7 +84,7 @@ export function RuleFormSheet({
 }) {
   const { t } = useI18n()
   const [pending, setPending] = React.useState(false)
-  // Keep the last target while the sheet animates out.
+  // Keep the last target while the dialog animates out.
   const [shown, setShown] = React.useState(target)
   if (target && target !== shown) setShown(target)
   const current = target ?? shown
@@ -101,12 +101,13 @@ export function RuleFormSheet({
       : t("rules.form.createDescription")
 
   return (
-    <Sheet open={target !== null} onOpenChange={(open) => !pending && onOpenChange(open)}>
-      <SheetContent className="w-full gap-0 sm:max-w-xl">
-        <SheetHeader className="border-b pr-12">
-          <SheetTitle>{title}</SheetTitle>
-          <SheetDescription>{description}</SheetDescription>
-        </SheetHeader>
+    <Dialog open={target !== null} onOpenChange={(open) => !pending && onOpenChange(open)}>
+      {/* Header and footer stay put; only the form scrolls. */}
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] flex-col gap-0 p-0 sm:max-w-xl">
+        <DialogHeader className="border-b p-4 pr-12">
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
+        </DialogHeader>
         {current && (
           <RuleForm
             target={current}
@@ -117,7 +118,7 @@ export function RuleFormSheet({
             }}
           />
         )}
-        <SheetFooter className="flex-row justify-end border-t">
+        <DialogFooter className="m-0">
           <Button
             type="button"
             variant="outline"
@@ -132,9 +133,9 @@ export function RuleFormSheet({
               ? t("rules.form.submitSave")
               : t("rules.form.submitCreate")}
           </Button>
-        </SheetFooter>
-      </SheetContent>
-    </Sheet>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -249,7 +250,7 @@ function RuleForm({
       id={FORM_ID}
       noValidate
       onSubmit={form.handleSubmit(onSubmit)}
-      className="flex-1 overflow-y-auto p-4"
+      className="overflow-y-auto p-4"
     >
       <FieldGroup>
         {formError && (
