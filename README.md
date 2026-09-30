@@ -2,7 +2,9 @@
 
 Lightweight TCP/UDP port forwarding manager written in Go, with a built-in web UI. A single static binary: lighter than nginx-proxy-manager, far easier to manage than rinetd.
 
-> The original Node.js implementation lives in [lieyanc/FireProxy](https://github.com/lieyanc/FireProxy) (also the `legacy` branch). Its `config.json` works unchanged.
+> The original Node.js implementation lives in [lieyanc/FireProxy](https://github.com/lieyanc/FireProxy) (also the `legacy` branch). Its `config.json` is accepted; inline forwarding rules migrate into a separate versioned rules file on first start.
+
+OpenWrt DMZ failover and per-node local IP/service overrides are described in [the deployment guide](docs/ha-openwrt.md). Gateways replicate rules directly with durable peer acknowledgments. OpenWrt uses its existing UCI API to switch selected DNAT destinations; no custom router plugin or etcd service is required.
 
 ## Features
 
@@ -35,7 +37,7 @@ Enter it in the UI together with a username and password. Forgot the password? S
 
 The UI listens on `127.0.0.1` by default. To reach it remotely, put it behind a TLS reverse proxy (recommended) or set `api.host` to `0.0.0.0`.
 
-Flags: `-c <path>` config file, `-v` print version, `-reset-auth` remove the admin account and API tokens. Signals: `SIGINT`/`SIGTERM` graceful shutdown, `SIGHUP` reload rules and log level from the config file.
+Flags: `-c <path>` config file, `-v` print version, `-reset-auth` remove the admin account and API tokens. Signals: `SIGINT`/`SIGTERM` graceful shutdown, `SIGHUP` reload node settings and the standalone rules snapshot.
 
 ### systemd
 
@@ -59,11 +61,11 @@ Self-update and the UI's restart button replace the process in place (same PID),
 
 ## Configuration
 
-Everything is editable from the UI; changes are written back to the config file atomically (mode `0600`, as it holds credential hashes). You can also edit the file by hand and send `SIGHUP` or click *Reload*. See `config.example.json`.
+Node settings and credentials are saved atomically to `config.json`; forwarding rules are saved separately to `rulesFile` (default `rules.json`, relative to the config directory). Both use mode `0600`. Use the UI/API to edit versioned rules. Router connection settings and node IDs are configured on disk and require restart; local address overrides are editable in Settings → Cluster. See `config.example.json` for legacy import compatibility.
 
-The complete default configuration is a JSON template compiled into the binary ([`internal/config/template.json`](internal/config/template.json)). On start, a missing config file is created from it, and fields missing from an existing file (including new ones added by an update) are filled in from it and saved. Values already in the file are never changed.
+The complete default configuration is a JSON template compiled into the binary ([`internal/config/template.json`](internal/config/template.json)). On start, a missing config file is created from it, and fields missing from an existing file (including new ones added by an update) are filled in from it and saved. Legacy inline `forward` is migrated out of the node file into the rules snapshot.
 
-Each entry in `forward`:
+Each entry in the rules snapshot’s `rules` array (or legacy import/export `forward`):
 
 | Field | Description |
 |---|---|

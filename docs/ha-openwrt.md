@@ -1,0 +1,124 @@
+# 节点同步与 OpenWrt DMZ 主备
+
+FireGateway 的规则由两台网关直接复制。OpenWrt 仅通过已有的 ubus / rpcd UCI API 修改现有 DMZ/DNAT 规则的目的 IP；不安装 FireGateway 插件、脚本或工具，不在路由器存放规则快照、心跳或租约。
+
+本版支持一对节点：初始主机 A，指定备用机 B。A 掉线后 B 自动接管，A 恢复不抢回入口。配置写入权限与流量角色分开管理；两节点失联时默认停止共享规则写入，继续使用已提交规则服务。它不提供两节点网络分区下的共识选举或硬件隔离。
+
+## 存储和同步
+
+| 位置 | 内容 |
+| --- | --- |
+| 节点 `config.json` | 节点身份、对端连接、路由凭据、本机地址覆盖 |
+| 节点 `rulesFile`，默认 `rules.json` | 已提交共享规则的可读快照 |
+| 同目录 `<rulesFile>.ha.json` | 带校验的权威复制检查点：已提交快照、待决事务、写入授权及最近请求结果 |
+| 同目录 `<rulesFile>.ha.json.lock` | 本机进程锁；进程退出后操作系统释放 |
+| 同目录 `<rulesFile>.ha.json.archive-*` | 提升、重新加入等操作前归档的旧状态，供核对和导出规则 |
+| 上游防火墙现有 redirect | 原有转发配置及当前目的 IP |
+
+正常保存经过主节点持久化候选、对端 prepare 落盘、对端 commit 落盘、主节点完成落盘，才返回同步成功。检查点用原子替换保存，`rules.json` 是它的派生视图；两文件之间崩溃后从检查点恢复。不要手工编辑集群规则缓存或删除检查点。
+
+变化即时发送；默认每 2 秒交换轻量版本摘要。重试沿用事务 ID。快照上限 256 KiB，普通请求结果保留最近 128 个；旧请求仍需通过预期版本检查。接管时不采用只 prepare、尚未 commit 的候选快照。
+
+请求超时可能意味着对端已经提交。API 返回 `sync_pending` 和可查询的更新标识，后台重试确认；不能把它理解为“修改未发生”。同步成功表示两台节点持久化，不表示备用监听或目标应用已就绪。
+
+## 节点配置
+
+两台机器固定 LAN IP，彼此可访问管理 API。节点专用 token、用户登录、OpenWrt 登录分别使用独立凭据。默认要求 HTTPS 对端地址，可在网关前配置现有 TLS 反向代理并用 `peerCaFile` 信任私有 CA。下面使用隔离管理网络内的 HTTP，因此显式开启 `allowHttpPeer`；普通网络请使用 HTTPS 并移除该选项。
+
+A 的示例字段合入它自己的 `config.json`：
+
+```json
+{
+  "api": { "enabled": true, "host": "192.168.1.10", "port": 9090 },
+  "rulesFile": "dmz-rules.json",
+  "node": {
+    "id": "gateway-a",
+    "ruleOverrides": {
+      "web": { "localHost": "192.168.1.10", "targetHost": "127.0.0.1", "targetPort": 3000 }
+    }
+  },
+  "cluster": {
+    "id": "dmz",
+    "initialWriter": "gateway-a",
+    "peerId": "gateway-b",
+    "peerUrl": "http://192.168.1.11:9090",
+    "peerToken": "replace-with-the-same-random-token-of-at-least-32-characters",
+    "allowHttpPeer": true,
+    "address": "192.168.1.10",
+    "peerAddress": "192.168.1.11",
+    "routerUrl": "https://192.168.1.1/ubus",
+    "username": "existing-router-api-user",
+    "password": "replace-with-router-password",
+    "caFile": "/etc/firegateway/router-ca.pem",
+    "redirects": ["firegateway_dmz"],
+    "pollInterval": 2,
+    "failoverAfter": 10
+  }
+}
+```
+
+B 使用同一集群 ID、初始写入者、随机 token、上游地址及受管 redirect；修改以下字段：
+
+| 字段 | B 的值 |
+| --- | --- |
+| `api.host` | `192.168.1.11` |
+| `node.id` | `gateway-b` |
+| `cluster.peerId` | `gateway-a` |
+| `cluster.peerUrl` | `http://192.168.1.10:9090` |
+| `cluster.address` | `192.168.1.11` |
+| `cluster.peerAddress` | `192.168.1.10` |
+| `node.ruleOverrides.web.localHost` | `192.168.1.11` |
+| `node.ruleOverrides.web.targetPort` | `4000`，若 B 上服务端口不同 |
+
+`peerToken` 应由安全随机数生成器生成，不使用示例文本。连接设置、节点身份和文件路径修改需要重启；本机规则覆盖可在设置页面直接修改。
+
+共享入口监听端口在两机保持一致，上游只切换目的 IP。目标服务可以使用不同的本机端口。服务进程、业务数据和连接状态不会随规则复制。
+
+## OpenWrt 条件
+
+设备需已提供 ubus HTTP API，账号具有所需原生方法权限：`uci.get`、`uci.changes`、`uci.set`、`uci.apply`、`uci.confirm`、`uci.revert`。权限或方法缺失时显示错误，不自动安装组件或开放更大权限。
+
+受管 redirect 必须已存在、启用、有稳定名称、`target=DNAT`，目的 IP 属于这对网关。不能使用 `@redirect[0]`。在路由器原管理界面创建并检查入口规则，例如现有全端口 DMZ 规则的 UCI 内容可以是：
+
+```uci
+config redirect 'firegateway_dmz'
+    option name 'FireGateway DMZ'
+    option src 'wan'
+    option dest 'lan'
+    option proto 'tcp udp'
+    option target 'DNAT'
+    option dest_ip '192.168.1.10'
+```
+
+也可管理已有的指定端口转发，无需配置全端口 DMZ。程序仅修改明确列出的 `dest_ip`，使用独立会话暂存，检查受管配置指纹，调用原生 `uci.apply` 的回滚机制，读回后 `uci.confirm`。不执行远程 shell，不清空连接跟踪。
+
+OpenWrt 的 apply 会触发配置变更事件；成功响应与读回证明配置已提交，**不能证明内核防火墙已重载成功或外部流量已经可达**。必须在目标设备上演练入口新连接。UCI 读后写也不是原子条件更新：受管入口应由单一控制器管理，切换期间避免 LuCI 或其他工具并发编辑防火墙。
+
+## 首次启动
+
+1. 停止旧版路由器插件控制器，导出已确认的共享规则。不要让两套入口控制器同时工作。
+2. 给两节点配置新参数和独立 `rulesFile`。A 可以携带旧 `forward`，首次启动自动迁移；B 保持规则为空，或与 A 完全一致。已有集群缓存不能直接作为新集群权威数据。
+3. 启动两节点并分别设置管理账号。在 A 的设置 → 主备集群点击“以本机规则配对节点”。此操作不联系路由器。
+4. 通过规则页面导入或维护规则，设置各节点本机覆盖。共享编辑需要唯一配置写入节点在线，页面会自动代理备用节点的编辑。
+5. 确认两节点规则已落盘、本机及对端接管准备均就绪、上游目标指向 A。没有启用规则或有绑定错误时不开放转发。
+
+空对端的第一次配对由其配置中的 `initialWriter` 和专用凭据授权；已有不一致的本地规则不会被静默覆盖。需要覆盖时先导出，再使用有明确归档确认的“重新加入”。
+
+## 故障与恢复
+
+- **A 整机掉线：** B 连续无法连接达到 `failoverAfter`（默认 10 秒），再进行一次独立认证探测；准备已提交规则、冻结迟到提交后切换入口。认证或协议配置错误不计为掉线。实际恢复还需加探测、API 操作和下一轮入口观测时间。
+- **切换请求超时：** 保持 `switch_pending`，不开启未确认的转发。检查路由器原生回滚结果与当前配置，再点击“重试待确认的入口切换”。
+- **A 恢复：** 观察到 B 的接管状态后归档未提交事务并保持配置只读，不抢回入口。确认双方提交点一致，可在 A 点击“移交配置写入权限”，将写入者交给 B；角色移交同样可恢复重试。
+- **A 长期停机且需要改规则：** 在 B 确认已停止或隔离旧配置写入者后，提升本机。进入明确标识的“仅本机保存”模式；此时不承诺第二副本。A 回归后在 A 归档旧状态并重新加入 B，两边匹配确认后退出单副本模式。
+- **回切与再次保护：** 恢复双节点同步及配置写入后，先在路由器原管理界面把入口改回初始主机 A，确认 A 准备就绪，再在 B 点击“回切后重新启用自动接管”。不会自动来回抢占。
+- **上游 API 不可用：** 节点间规则复制仍可工作；转发资格的入口观测独立过期，默认约 `2 * pollInterval + 2` 秒后关闭旧转发。它是本机保护窗口，不是路由器租约。
+
+两节点互联中断也可能触发 B 接管；没有第三方仲裁，不能仅靠探测消除误判。固定单向自动接管避免反复抢入口，配置单写和失联只读避免两份独立配置同时被确认。已有 TCP 连接需要重连，旧 UDP NAT 映射可能等待设备超时，不保证无损切换。
+
+## 检查与备份
+
+`GET /api/cluster` 查看流量角色、配置写入者、同步状态、两节点持久化和准备状态、入口状态及错误。`GET /ready` 仅在本机可以转发且启用规则监听正常时返回 200，不验证目标应用健康。
+
+备份各节点的 `config.json`、`rulesFile` 和 `.ha.json` 检查点。运行中复制这些文件不等于取得一致性备份；建议停机备份，或通过 `GET /api/cluster/snapshot` 导出已提交共享规则。归档文件用于审计、比较与提取规则，不应直接覆盖正在运行的检查点。
+
+已提供复制丢包、崩溃恢复、冲突、非抢占、认证、原生 UCI 调用及 HTTP API 测试。真实 OpenWrt 固件上的 ACL、apply 事件、fw3/fw4 重载、NAT 映射仍需实机验收。

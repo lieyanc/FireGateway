@@ -1,5 +1,29 @@
 # FireGateway HTTP API
 
+## Peer replication and router failover
+
+These management endpoints require ordinary user authentication. Node replication uses a separate credential and never copies user or router credentials.
+
+- `GET /api/cluster`: traffic `role` (`standalone`, `active`, `standby`, `disconnected`), `owner`, `address`, `configRole` (`writer`, `replica`, `read_only`), `writer`, `paired`, `epoch`, `desiredRevision`, `checksum`, `appliedRevision`, `localPreparedChecksum`, `peerState`, `peerEpoch`, `peerRevision`, `peerChecksum`, `peerPreparedChecksum`, `replicationState`, `pendingUpdateId?`, `upstreamState`, `takenOver`, `error?`, `syncError?`, `lastSync?`. `lastSync` records successful peer contact; readiness and durable replication are separate. Compare checksums, not revision numbers alone across writer epochs.
+- `POST /api/cluster/bootstrap`: pair from the configured initial writer; returns `{initialized: true}`. The peer must be reachable and empty or have matching initial rules. Does not contact the router.
+- `POST /api/cluster/transfer`: freeze and durably transfer configuration write authority to the paired node. Does not move ingress.
+- `POST /api/cluster/promote` with `{fencedPeer: true}`: explicitly promote this node after stopping/isolating the previous writer. Archives old state and enables clearly marked local-only writes until rejoin.
+- `POST /api/cluster/rejoin` with `{archiveLocal: true}`: archive this node's state and adopt the peer writer's committed snapshot. Re-establish matching state before disabling degraded mode.
+- `POST /api/cluster/retry-switch`: retry an unconfirmed upstream change after checking the device's current state.
+- `POST /api/cluster/rearm`: on B, rearm automatic takeover after restoring peer replication and manually returning ingress to the initial primary A.
+- `GET /api/cluster/transactions/{id}`: inspect a pending transaction or a retained request receipt. IDs can be transaction IDs (while pending) or the original `Idempotency-Key`. Recent 128 request results are retained; 404 requires refreshing current state, not assuming the operation never happened.
+- `GET /api/cluster/snapshot`: download the committed shared snapshot without credentials or local overrides.
+- `GET /api/node`: `{node: {id, ruleOverrides}, addresses, effectiveRules, rulesFile}`. `PUT /api/node` updates local overrides only, keyed by rule ID with optional `localHost`, `targetHost`, `localPort`, `targetPort`. Unspecified fields inherit shared values. Node identity is immutable while running; single-port overrides do not apply to ranges. OpenWrt mode requires matching ingress ports across nodes.
+- `GET /ready`: public, 200 only while forwarding is allowed and all active rules are listening; otherwise 503. Does not probe target application health.
+
+Cluster shared-rule mutations require `If-Match: "<checksum>"` (from the `GET /api/rules` ETag) and a stable `Idempotency-Key` of 8–128 characters. The web UI sends them automatically. Standby requests are authenticated locally and forwarded to the unique configuration writer. Stale versions or reused IDs with different content return 409. Known disconnected pairs are read-only; confirmed promotion allows local-only writes.
+
+Ordinary successful writes have durably committed on both nodes. `X-Rule-Durability` is `replicated` or `local_only`; it does not mean listeners are ready. A lost commit confirmation returns 503 with `error: "sync_pending"` and an update identifier; the write may already exist on the peer. Query/retry with the same request ID and original precondition. Never blindly resubmit using a fresh ID after an uncertain result. An outcome persisted before an HTTP receipt could be saved is reported as already committed; refresh rather than executing it again.
+
+`POST /internal/ha/v1` is the protocol-1 node endpoint (`heartbeat`, `snapshot`, `prepare`, `commit`, `handoff-prepare`, `handoff-commit`, `resume`, `mutate`). It accepts only the configured peer bearer token, node identity, cluster identity, receiver identity and matching pair topology. User cookies/API tokens do not authenticate this endpoint. Mutations carry pair identity, writer epoch, parent checksum and transaction identity; arbitrary newer snapshots are not installed.
+
+Legacy `forward` imports/exports remain supported. `rulesFile` is independent of local settings; clustered state is recovered from the adjacent `.ha.json` atomic checkpoint. See [deployment and recovery](ha-openwrt.md).
+
 The web UI and the HTTP API share one listener (`api.host:api.port`, default `127.0.0.1:8080`). The UI is served from `/`; the API lives under `/api`.
 
 Conventions:
@@ -157,11 +181,11 @@ type Overview = {
 | `POST /api/rules/batch` | `{action: "enable"\|"disable"\|"delete", ids: string[]}` | `{ok: string[], failed: {id, message}[]}` |
 | `GET /api/rules/export` | – | `{forward: Rule[]}` with `Content-Disposition: attachment` |
 | `POST /api/rules/import` | `{forward: Rule[], mode: "merge"\|"replace"}` | `{added, updated, removed: number}` — merge upserts by id; replace drops rules not in the payload |
-| `POST /api/config/reload` | – | `{added, updated, removed}` — re-reads rules and log level from the config file on disk |
+| `POST /api/config/reload` | – | `{added, updated, removed}` — re-reads node settings and, in standalone mode, the versioned rules snapshot |
 
 Validation failures return `400 validation` with `field` set (e.g. `"localPort"`, `"acl.cidrs[2]"`, `"localPortRange"`). Duplicate id → `409 conflict`. Listen conflicts with another active rule (same type, overlapping host:port) → `409 conflict`. A rule whose ports fail to bind at the OS level is still saved; its `runtime.state` is `error`/`partial` with `failures`.
 
-Changes are hot-applied: editing only `name`, `remark`, `acl`, `limits` or the target keeps listeners and live connections; changing type, listen host or ports re-binds listeners (and closes that rule's connections). Every successful mutation is persisted to the config file atomically.
+Changes are hot-applied: editing only `name`, `remark`, `acl`, `limits` or the target keeps listeners and live connections; changing type, listen host or ports re-binds listeners (and closes that rule's connections). Every successful rule mutation is persisted to the versioned rules file atomically; cluster mode confirms a peer transaction first. Batch changes publish one snapshot for all accepted items. Replication never calls the upstream router.
 
 ## Connections
 
