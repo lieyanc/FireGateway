@@ -88,6 +88,9 @@ func (s *Server) routes() http.Handler {
 
 	h("GET /api/overview", s.overview)
 	h("GET /api/cluster", s.clusterStatus)
+	h("GET /api/cluster/config", s.getClusterConnection)
+	h("PUT /api/cluster/config", s.putClusterConnection)
+	h("POST /api/cluster/test-peer", s.testPeerConnection)
 	h("GET /api/cluster/snapshot", s.clusterSnapshot)
 	h("POST /api/cluster/bootstrap", s.clusterBootstrap)
 	h("POST /api/cluster/{action}", s.clusterAction)

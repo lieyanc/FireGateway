@@ -103,7 +103,26 @@ func openRules(path string, legacy []Rule, clusterID string) (*RuleStore, error)
 		return nil, err
 	}
 	if s.cur.ClusterID != clusterID {
-		return nil, fmt.Errorf("rules file belongs to cluster %q, configured cluster is %q; use a separate rulesFile when joining or leaving a cluster", s.cur.ClusterID, clusterID)
+		// First activation adopts standalone rules at startup, after the node
+		// config was saved. Repeating after a crash is safe; existing cluster
+		// identities and replicated snapshots can never be relabelled.
+		if s.cur.ClusterID != "" || clusterID == "" || s.cur.SchemaVersion != 1 || s.cur.WriterEpoch != 0 || s.cur.WriterID != "" {
+			return nil, fmt.Errorf("rules file belongs to cluster %q, configured cluster is %q; use a separate rulesFile when joining or leaving a cluster", s.cur.ClusterID, clusterID)
+		}
+		if _, err := os.Stat(path + ".ha.json"); !errors.Is(err, os.ErrNotExist) {
+			return nil, errors.New("cannot adopt standalone rules with an existing or inaccessible HA checkpoint")
+		}
+		next := NewRuleSet(clusterID, s.cur.Revision, s.cur.Rules)
+		if err := next.Verify(); err != nil {
+			return nil, err
+		}
+		if len(legacy) > 0 && NewRuleSet(clusterID, next.Revision, legacy).Checksum != next.Checksum {
+			return nil, errors.New("inline rules conflict with the standalone snapshot")
+		}
+		if err := writeJSONFile(path, next); err != nil {
+			return nil, err
+		}
+		s.cur = next
 	}
 	if len(legacy) > 0 && NewRuleSet(clusterID, s.cur.Revision, legacy).Checksum != s.cur.Checksum {
 		return nil, errors.New("both inline forward and rulesFile contain different rules; resolve the conflict before migration")

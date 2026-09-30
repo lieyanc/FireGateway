@@ -1,7 +1,6 @@
 package config
 
 import (
-	"fmt"
 	"net/netip"
 	"net/url"
 	"regexp"
@@ -49,7 +48,7 @@ func validEndpoint(raw string, httpAllowed bool) bool {
 func (c *Config) ValidateNode() error {
 	if c.Node.ID != "" {
 		if err := ValidateID(RuleID(c.Node.ID)); err != nil {
-			return fmt.Errorf("node.id: %w", err)
+			return &FieldError{"node.id", err.Error()}
 		}
 	}
 	for id, o := range c.Node.RuleOverrides {
@@ -76,7 +75,7 @@ func (c *Config) ValidateNode() error {
 			return &FieldError{"node.id", "required in cluster mode"}
 		}
 		if err := ValidateID(RuleID(cc.ID)); err != nil {
-			return fmt.Errorf("cluster.id: %w", err)
+			return &FieldError{"cluster.id", err.Error()}
 		}
 		if !c.API.Enabled {
 			return &FieldError{"api.enabled", "node replication requires the management API"}

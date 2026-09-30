@@ -111,6 +111,9 @@ func NewPeerClient(cfg config.ClusterConfig, node string) (*PeerClient, error) {
 	}
 	return &PeerClient{cfg: cfg, node: node, http: h}, nil
 }
+
+func (p *PeerClient) Close() { p.http.CloseIdleConnections() }
+
 func topology(cfg config.ClusterConfig, node string) string {
 	b, _ := json.Marshal(struct {
 		InitialWriter, Router string

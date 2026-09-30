@@ -218,6 +218,8 @@ type Store struct {
 	mu    sync.Mutex // serializes writers
 	cur   *Config
 	rw    sync.RWMutex
+	// Saved connection changes remain separate from the running controller.
+	connection *ClusterConnection // protected by mu; applied on process restart
 }
 
 // OpenState reports what Open did to the config file.
@@ -313,7 +315,7 @@ func (s *Store) Update(fn func(c *Config) error) (*Config, error) {
 		return nil, err
 	}
 	if next.RulesFile != before.RulesFile || !reflect.DeepEqual(next.Cluster, before.Cluster) || next.Node.ID != before.Node.ID {
-		return nil, &FieldError{"node.id", "rulesFile, node.id and cluster settings must be edited on disk and require a restart"}
+		return nil, &FieldError{"node.id", "use cluster connection settings for node identity and cluster changes; a restart is required"}
 	}
 	changedRules := !reflect.DeepEqual(before.Forward, next.Forward)
 	rules := next.Forward
@@ -369,11 +371,19 @@ func (s *Store) Reload() (old, cur *Config, err error) {
 	s.rw.Lock()
 	s.cur = next
 	s.rw.Unlock()
+	s.connection = nil
 	return old, s.Get(), nil
 }
 
 func (s *Store) write(c *Config) error {
 	out := *c
+	if s.connection != nil {
+		out.Node.ID = s.connection.NodeID
+		out.Cluster = s.connection.Cluster
+	}
 	out.Forward = nil
+	if err := out.ValidateNode(); err != nil {
+		return err
+	}
 	return writeJSONFile(s.path, &out)
 }

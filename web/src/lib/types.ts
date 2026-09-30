@@ -278,7 +278,13 @@ export type SettingsUpdateResult = {
 // ---- Update ----
 
 export type UpdateState =
-  "idle" | "checking" | "downloading" | "ready" | "waiting" | "applying" | "failed"
+  | "idle"
+  | "checking"
+  | "downloading"
+  | "ready"
+  | "waiting"
+  | "applying"
+  | "failed"
 
 export type UpdateStatus = {
   state: UpdateState
@@ -317,6 +323,34 @@ export type RulesEvent = {
 }
 
 // ---- Node-local overrides and upstream-router HA ----
+export type ClusterConnection = {
+  id: string
+  peerId: string
+  peerUrl: string
+  peerToken: string
+  peerCaFile?: string
+  initialWriter: string
+  address: string
+  peerAddress: string
+  routerUrl: string
+  username: string
+  password: string
+  caFile?: string
+  redirects: string[]
+  pollInterval: number
+  failoverAfter: number
+  allowHttpPeer?: boolean
+}
+export type ClusterConnectionInput = {
+  nodeId: string
+  cluster: ClusterConnection | null
+}
+export type ClusterConnectionInfo = ClusterConnectionInput & {
+  peerTokenConfigured: boolean
+  routerPasswordConfigured: boolean
+  restartRequired: boolean
+  identityLocked: boolean
+}
 export type NodeConfig = {
   id: string
   ruleOverrides: Record<

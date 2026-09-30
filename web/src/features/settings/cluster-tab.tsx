@@ -29,6 +29,7 @@ import { api } from "@/lib/api"
 import { toastError } from "@/lib/errors"
 import { useRules } from "@/lib/queries"
 import type { NodeInfo, NodeConfig, RuleView, ClusterStatus } from "@/lib/types"
+import { ClusterConnectionSettings } from "@/features/settings/cluster-connection"
 
 export function ClusterTab() {
   const { t } = useI18n()
@@ -63,6 +64,7 @@ export function ClusterTab() {
   const state = status.data
   return (
     <div className="flex flex-col gap-4">
+      <ClusterConnectionSettings />
       <Card>
         <CardHeader>
           <CardTitle>{t("cluster.title")}</CardTitle>

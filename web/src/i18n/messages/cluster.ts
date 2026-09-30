@@ -15,7 +15,7 @@ export const cluster = defineMessages({
     desired: "Shared revision",
     applied: "Prepared revision",
     configure:
-      "Configure both node IDs, peer addresses and credentials, and the upstream connection, then restart.",
+      "Complete the node connection form above on both gateways, save and restart, then pair from the initial primary.",
     initialize: "Pair from this node",
     initializing: "Initializing…",
     initialized: "Nodes paired",
@@ -97,7 +97,7 @@ export const cluster = defineMessages({
     desired: "共享规则版本",
     applied: "本机准备版本",
     configure:
-      "在两台节点配置文件中填写节点身份、对端地址与凭据、上游连接信息，重启后启用。",
+      "在两台网关上填写上方节点连接表单，保存并重启后，从初始主节点发起配对。",
     initialize: "以本机规则配对节点",
     initializing: "正在初始化…",
     initialized: "节点已配对",

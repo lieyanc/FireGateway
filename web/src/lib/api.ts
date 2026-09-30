@@ -3,6 +3,8 @@ import type {
   NodeInfo,
   NodeConfig,
   ClusterStatus,
+  ClusterConnectionInfo,
+  ClusterConnectionInput,
   ApiToken,
   AuthState,
   BatchAction,
@@ -185,6 +187,11 @@ const enc = encodeURIComponent
 
 export const api = {
   cluster: {
+    connection: () => get<ClusterConnectionInfo>("/api/cluster/config"),
+    saveConnection: (body: ClusterConnectionInput) =>
+      put<ClusterConnectionInfo>("/api/cluster/config", body),
+    testPeer: () =>
+      post<{ connected: boolean; nodeId: string }>("/api/cluster/test-peer"),
     status: () => get<ClusterStatus>("/api/cluster"),
     bootstrap: () => post<{ initialized: boolean }>("/api/cluster/bootstrap"),
     transfer: () => post<ClusterStatus>("/api/cluster/transfer"),
@@ -277,7 +284,8 @@ export const api = {
   update: {
     status: () => get<UpdateStatus>("/api/update/status"),
     check: () => post<UpdateCheckResult>("/api/update/check"),
-    apply: (force = false) => post<Record<string, never>>("/api/update/apply", { force }),
+    apply: (force = false) =>
+      post<Record<string, never>>("/api/update/apply", { force }),
     dismiss: () => post<void>("/api/update/dismiss"),
   },
 }
