@@ -1,4 +1,4 @@
-.PHONY: all web build run dev dev-web test lint clean
+.PHONY: all web build run dev dev-web test stress-udp lint clean
 
 BIN     ?= bin/firegateway
 CONFIG  ?= config.json
@@ -34,6 +34,10 @@ dev-web: web/node_modules
 test:
 	go vet ./...
 	go test -race ./...
+
+# Opt-in local stress check; excluded from ordinary tests and CI.
+stress-udp:
+	go test -tags=stress ./internal/proxy -run '^TestUDPBurst$$' -count=1 -v
 
 lint: web/node_modules
 	npm run --prefix web lint

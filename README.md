@@ -109,9 +109,17 @@ curl -H "Authorization: Bearer fgw_..." http://127.0.0.1:8080/api/rules
 make run        # full build, then run bin/firegateway (CONFIG=config.json)
 make dev        # backend on :8080 with the UI currently in web/dist
 make dev-web    # Vite dev server on :5173 proxying /api to :8080 (hot reload)
-make test       # go vet + go test -race
+make test       # go vet + go test -race (excludes local stress tests)
+make stress-udp # opt-in local UDP burst stress check
 make lint       # frontend lint
 ```
+
+The UDP burst stress check uses the `stress` build tag and is excluded from CI.
+It sends all 120 datagrams before reading replies and requires zero loss, so
+its result depends on local socket buffer limits and scheduling. Use it on a
+controlled local machine; a timeout alone does not identify a forwarding bug.
+Existing throughput benchmarks can be run with
+`go test ./internal/proxy -run '^$' -bench . -benchmem`.
 
 Layout:
 
