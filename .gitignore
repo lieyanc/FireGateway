@@ -5,3 +5,9 @@
 /firegateway
 /bin/
 /dist/
+
+/rules.json
+
+*.ha.json
+*.ha.json.lock
+*.ha.json.archive-*

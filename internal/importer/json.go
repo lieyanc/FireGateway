@@ -79,6 +79,9 @@ var errTrailing = errors.New("unexpected content after the first value")
 func ruleList(v any) ([]json.RawMessage, bool) {
 	switch t := v.(type) {
 	case map[string]any:
+		if f, ok := t["rules"]; ok {
+			return ruleList(f)
+		}
 		if f, ok := t["forward"]; ok {
 			return ruleList(f)
 		}

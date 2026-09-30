@@ -1,5 +1,8 @@
 import type {
   ApiErrorBody,
+  NodeInfo,
+  NodeConfig,
+  ClusterStatus,
   ApiToken,
   AuthState,
   BatchAction,
@@ -93,12 +96,47 @@ async function toApiError(res: Response): Promise<ApiError> {
   )
 }
 
+let ruleVersion = ""
+function sharedRuleMutation(method: string, path: string) {
+  return (
+    method !== "GET" &&
+    (path === "/api/rules" ||
+      path === "/api/rules/import" ||
+      path === "/api/rules/batch" ||
+      (path.startsWith("/api/rules/") &&
+        !path.startsWith("/api/rules/import/") &&
+        !path.endsWith("/restart")))
+  )
+}
+
 export async function request<T>(
   method: string,
   path: string,
-  options: { body?: unknown; query?: Query; signal?: AbortSignal } = {}
+  options: {
+    body?: unknown
+    query?: Query
+    signal?: AbortSignal
+    requestId?: string
+  } = {}
 ): Promise<T> {
   const headers: Record<string, string> = { Accept: "application/json" }
+  if (sharedRuleMutation(method, path)) {
+    if (!ruleVersion) {
+      const snapshot = await fetch("/api/rules", {
+        credentials: "same-origin",
+        signal: options.signal,
+      })
+      if (!snapshot.ok) throw await toApiError(snapshot)
+      ruleVersion = snapshot.headers.get("ETag") ?? ""
+      await snapshot.text()
+    }
+    if (ruleVersion) headers["If-Match"] = ruleVersion
+    headers["Idempotency-Key"] =
+      options.requestId ??
+      Array.from(crypto.getRandomValues(new Uint8Array(24)), (v) =>
+        v.toString(16).padStart(2, "0")
+      ).join("")
+  }
   const init: RequestInit = {
     method,
     headers,
@@ -120,7 +158,11 @@ export async function request<T>(
     throw new ApiError(0, "network", "Network error")
   }
 
+  const etag = res.headers.get("ETag")
+  if (etag && (path === "/api/rules" || sharedRuleMutation(method, path)))
+    ruleVersion = etag
   if (!res.ok) {
+    if (res.status === 409) ruleVersion = ""
     const error = await toApiError(res)
     if (res.status === 401) unauthorizedListener?.(path)
     throw error
@@ -142,6 +184,21 @@ const del = <T>(path: string, query?: Query) =>
 const enc = encodeURIComponent
 
 export const api = {
+  cluster: {
+    status: () => get<ClusterStatus>("/api/cluster"),
+    bootstrap: () => post<{ initialized: boolean }>("/api/cluster/bootstrap"),
+    transfer: () => post<ClusterStatus>("/api/cluster/transfer"),
+    promote: () =>
+      post<ClusterStatus>("/api/cluster/promote", { fencedPeer: true }),
+    rejoin: () =>
+      post<ClusterStatus>("/api/cluster/rejoin", { archiveLocal: true }),
+    retrySwitch: () => post<ClusterStatus>("/api/cluster/retry-switch"),
+    rearm: () => post<ClusterStatus>("/api/cluster/rearm"),
+  },
+  node: {
+    get: () => get<NodeInfo>("/api/node"),
+    update: (node: NodeConfig) => put<NodeInfo>("/api/node", node),
+  },
   auth: {
     state: () => get<AuthState>("/api/auth/state"),
     setup: (body: { setupToken: string; username: string; password: string }) =>

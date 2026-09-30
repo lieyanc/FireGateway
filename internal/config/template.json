@@ -25,5 +25,9 @@
     "repo": "lieyanc/FireGateway"
   },
   "dataDir": "./data",
-  "forward": []
+  "rulesFile": "rules.json",
+  "node": {
+    "id": "",
+    "ruleOverrides": {}
+  }
 }

@@ -76,7 +76,7 @@ func TestCompleteMissingFields(t *testing.T) {
 		t.Errorf("unexpected completed config: %+v", c)
 	}
 	data, _ := os.ReadFile(p)
-	for _, want := range []string{`"port": 9000`, `"enabled": false`, `"host": "127.0.0.1"`, `"proxyBaseUrl": ""`, `"sessionTtl": 604800`, `"id": 1`} {
+	for _, want := range []string{`"port": 9000`, `"enabled": false`, `"host": "127.0.0.1"`, `"proxyBaseUrl": ""`, `"sessionTtl": 604800`} {
 		if !strings.Contains(string(data), want) {
 			t.Errorf("completed file lacks %s:\n%s", want, data)
 		}
@@ -127,7 +127,7 @@ func TestCreateDefaultAndPersist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, _ := os.ReadFile(p)
+	data, _ := os.ReadFile(s.Rules().Path())
 	// Numeric ids stay numbers on disk.
 	if !strings.Contains(string(data), `"id": 7`) {
 		t.Errorf("numeric id not preserved:\n%s", data)

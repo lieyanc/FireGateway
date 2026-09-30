@@ -278,12 +278,7 @@ export type SettingsUpdateResult = {
 // ---- Update ----
 
 export type UpdateState =
-  | "idle"
-  | "checking"
-  | "downloading"
-  | "ready"
-  | "applying"
-  | "failed"
+  "idle" | "checking" | "downloading" | "ready" | "applying" | "failed"
 
 export type UpdateStatus = {
   state: UpdateState
@@ -319,4 +314,53 @@ export type StatsEvent = {
 export type RulesEvent = {
   action: "created" | "updated" | "deleted" | "reloaded"
   id?: string
+}
+
+// ---- Node-local overrides and upstream-router HA ----
+export type NodeConfig = {
+  id: string
+  ruleOverrides: Record<
+    string,
+    {
+      localHost?: string
+      targetHost?: string
+      localPort?: number
+      targetPort?: number
+    }
+  >
+}
+export type NodeInfo = {
+  node: NodeConfig
+  addresses: string[]
+  rulesFile: string
+  effectiveRules: Rule[]
+}
+export type ClusterStatus = {
+  enabled: boolean
+  nodeId: string
+  clusterId: string
+  role: "standalone" | "active" | "standby" | "disconnected"
+  owner: string
+  address: string
+  desiredRevision: number
+  appliedRevision: number
+  checksum: string
+  error?: string
+  syncError?: string
+  lastSync?: string
+  paired: boolean
+  epoch: number
+  writer: string
+  peerEpoch: number
+  takenOver: boolean
+  configRole: "writer" | "replica" | "read_only"
+  replicationState: "waiting" | "local_only" | "pending" | "synced" | "unpaired"
+  peerState: "unknown" | "online" | "offline" | "error"
+  upstreamState:
+    "unknown" | "observed" | "applied" | "unavailable" | "switch_pending"
+  peerRevision: number
+  peerChecksum: string
+  peerPreparedChecksum: string
+  localPreparedChecksum: string
+  pendingUpdateId?: string
 }

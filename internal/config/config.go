@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -21,12 +22,15 @@ import (
 var template []byte
 
 type Config struct {
-	API     APIConfig    `json:"api"`
-	Auth    AuthConfig   `json:"auth"`
-	Logging LogConfig    `json:"logging"`
-	Update  UpdateConfig `json:"update"`
-	DataDir string       `json:"dataDir"`
-	Forward []Rule       `json:"forward"`
+	API       APIConfig      `json:"api"`
+	Auth      AuthConfig     `json:"auth"`
+	Logging   LogConfig      `json:"logging"`
+	Update    UpdateConfig   `json:"update"`
+	DataDir   string         `json:"dataDir"`
+	Forward   []Rule         `json:"forward,omitempty"` // legacy import and in-memory compatibility view
+	RulesFile string         `json:"rulesFile"`
+	Node      NodeConfig     `json:"node"`
+	Cluster   *ClusterConfig `json:"cluster,omitempty"`
 }
 
 type APIConfig struct {
@@ -129,6 +133,20 @@ func (c *Config) applyDefaults() {
 	if c.Auth.SessionTTL <= 0 {
 		c.Auth.SessionTTL = d.Auth.SessionTTL
 	}
+	if c.RulesFile == "" {
+		c.RulesFile = "rules.json"
+	}
+	if c.Node.RuleOverrides == nil {
+		c.Node.RuleOverrides = map[RuleID]RuleOverride{}
+	}
+	if c.Cluster != nil {
+		if c.Cluster.PollInterval == 0 {
+			c.Cluster.PollInterval = 2
+		}
+		if c.Cluster.FailoverAfter == 0 {
+			c.Cluster.FailoverAfter = 10
+		}
+	}
 	if c.Forward == nil {
 		c.Forward = []Rule{}
 	}
@@ -195,10 +213,11 @@ func missingKeys(want, have map[string]any) bool {
 // Store owns the current configuration and its file. All mutations go
 // through Update, which validates, persists atomically, then publishes.
 type Store struct {
-	path string
-	mu   sync.Mutex // serializes writers
-	cur  *Config
-	rw   sync.RWMutex
+	path  string
+	rules *RuleStore
+	mu    sync.Mutex // serializes writers
+	cur   *Config
+	rw    sync.RWMutex
 }
 
 // OpenState reports what Open did to the config file.
@@ -214,35 +233,67 @@ const (
 // lacking fields is completed from it and rewritten.
 func Open(path string) (*Store, OpenState, error) {
 	s := &Store{path: path}
+	state := Loaded
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		s.cur = Default()
-		return s, Created, s.write(s.cur)
+		s.cur, state = Default(), Created
+	} else if err != nil {
+		return nil, Loaded, err
+	} else {
+		var incomplete bool
+		s.cur, incomplete, err = parse(data)
+		if err != nil {
+			return nil, Loaded, err
+		}
+		var fields map[string]json.RawMessage
+		_ = json.Unmarshal(data, &fields)
+		if _, legacy := fields["forward"]; incomplete || legacy {
+			state = Completed
+		}
 	}
-	if err != nil {
+	s.cur.applyDefaults()
+	if err := s.cur.ValidateNode(); err != nil {
 		return nil, Loaded, err
 	}
-	cur, incomplete, err := parse(data)
+	rulesPath := s.cur.RulesFile
+	if !filepath.IsAbs(rulesPath) {
+		rulesPath = filepath.Join(filepath.Dir(path), rulesPath)
+	}
+	configAbs, _ := filepath.Abs(path)
+	rulesAbs, _ := filepath.Abs(rulesPath)
+	if configAbs == rulesAbs {
+		return nil, Loaded, errors.New("rulesFile must differ from the node config file")
+	}
+	clusterID := ""
+	if s.cur.Cluster != nil {
+		clusterID = s.cur.Cluster.ID
+	}
+	s.rules, err = openRules(rulesPath, s.cur.Forward, clusterID)
 	if err != nil {
-		return nil, Loaded, err
+		return nil, Loaded, fmt.Errorf("open rules: %w", err)
 	}
-	s.cur = cur
-	if !incomplete {
-		return s, Loaded, nil
+	s.cur.Forward = nil
+	if state != Loaded {
+		if err := s.write(s.cur); err != nil {
+			return nil, Loaded, err
+		}
 	}
-	if err := s.write(cur); err != nil {
-		return nil, Loaded, fmt.Errorf("complete config: %w", err)
-	}
-	return s, Completed, nil
+	return s, state, nil
 }
+
+func (s *Store) Rules() *RuleStore { return s.rules }
 
 func (s *Store) Path() string { return s.path }
 
 // Get returns the current config. Callers must treat it as read-only.
 func (s *Store) Get() *Config {
 	s.rw.RLock()
-	defer s.rw.RUnlock()
-	return s.cur
+	out := *s.cur
+	s.rw.RUnlock()
+	if s.rules != nil {
+		out.Forward = s.rules.Snapshot().Rules
+	}
+	return &out
 }
 
 // Update applies fn to a copy of the config and persists the result. If fn
@@ -250,18 +301,41 @@ func (s *Store) Get() *Config {
 func (s *Store) Update(fn func(c *Config) error) (*Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := s.Get().Clone()
+	previous := s.rules.Snapshot()
+	before := s.Get().Clone()
+	before.Forward = previous.Rules
+	next := before.Clone()
 	if err := fn(next); err != nil {
 		return nil, err
 	}
 	next.applyDefaults()
-	if err := s.write(next); err != nil {
-		return nil, fmt.Errorf("save config: %w", err)
+	if err := next.ValidateNode(); err != nil {
+		return nil, err
 	}
-	s.rw.Lock()
-	s.cur = next
-	s.rw.Unlock()
-	return next, nil
+	if next.RulesFile != before.RulesFile || !reflect.DeepEqual(next.Cluster, before.Cluster) || next.Node.ID != before.Node.ID {
+		return nil, &FieldError{"node.id", "rulesFile, node.id and cluster settings must be edited on disk and require a restart"}
+	}
+	changedRules := !reflect.DeepEqual(before.Forward, next.Forward)
+	rules := next.Forward
+	before.Forward, next.Forward = nil, nil
+	changedLocal := !reflect.DeepEqual(before, next)
+	if changedRules && changedLocal {
+		return nil, errors.New("update node settings and shared rules separately")
+	}
+	if changedRules {
+		if _, err := s.rules.Update(previous, rules); err != nil {
+			return nil, err
+		}
+	}
+	if changedLocal {
+		if err := s.write(next); err != nil {
+			return nil, fmt.Errorf("save config: %w", err)
+		}
+		s.rw.Lock()
+		s.cur = next
+		s.rw.Unlock()
+	}
+	return s.Get(), nil
 }
 
 // Reload re-reads the file from disk and returns the previous and new config.
@@ -276,44 +350,30 @@ func (s *Store) Reload() (old, cur *Config, err error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	old = s.Get()
+	if next.RulesFile != old.RulesFile || !reflect.DeepEqual(next.Cluster, old.Cluster) || next.Node.ID != old.Node.ID {
+		return nil, nil, errors.New("rulesFile, node.id or cluster changed; restart required")
+	}
+	if len(next.Forward) != 0 {
+		return nil, nil, errors.New("forward has moved to rulesFile; use the rule management API")
+	}
+	if err := next.ValidateNode(); err != nil {
+		return nil, nil, err
+	}
+	if old.Cluster == nil {
+		if err := s.rules.Reload(); err != nil {
+			return nil, nil, err
+		}
+	}
+	next.Forward = nil
 	s.rw.Lock()
-	old, s.cur = s.cur, next
+	s.cur = next
 	s.rw.Unlock()
-	return old, next, nil
+	return old, s.Get(), nil
 }
 
-// write saves c via a temp file and rename so readers never see a torn file.
-// The file holds credential hashes, so it is kept private.
 func (s *Store) write(c *Config) error {
-	data, err := json.MarshalIndent(c, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(dir, ".config-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	defer os.Remove(tmp)
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, s.path)
+	out := *c
+	out.Forward = nil
+	return writeJSONFile(s.path, &out)
 }

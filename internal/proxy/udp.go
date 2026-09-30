@@ -185,6 +185,9 @@ func (l *udpListener) serve() {
 
 // forward sends datagrams from one client upstream.
 func (l *udpListener) forward(client netip.AddrPort, pkts []udpPacket, out []ipv4.Message) {
+	if l.rn.gate != nil && !l.rn.gate() {
+		return
+	}
 	r := l.rn
 	retried := false
 	s := l.session(client)

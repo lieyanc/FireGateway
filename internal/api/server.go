@@ -18,11 +18,13 @@ import (
 	"github.com/lieyanc/FireGateway/internal/config"
 	"github.com/lieyanc/FireGateway/internal/events"
 	"github.com/lieyanc/FireGateway/internal/gateway"
+	"github.com/lieyanc/FireGateway/internal/ha"
 	"github.com/lieyanc/FireGateway/internal/metrics"
 	"github.com/lieyanc/FireGateway/internal/updater"
 )
 
 type Deps struct {
+	Cluster *ha.Controller
 	Store   *config.Store
 	Manager *gateway.Manager
 	Sampler *metrics.Sampler
@@ -71,6 +73,7 @@ func (s *Server) routes() http.Handler {
 
 	// Public.
 	h("GET /health", s.health)
+	h("GET /ready", s.ready)
 	h("GET /api/version", s.version)
 	h("GET /api/auth/state", s.authState)
 	h("POST /api/auth/setup", s.setup)
@@ -84,6 +87,16 @@ func (s *Server) routes() http.Handler {
 	h("DELETE /api/auth/tokens/{id}", s.deleteToken)
 
 	h("GET /api/overview", s.overview)
+	h("GET /api/cluster", s.clusterStatus)
+	h("GET /api/cluster/snapshot", s.clusterSnapshot)
+	h("POST /api/cluster/bootstrap", s.clusterBootstrap)
+	h("POST /api/cluster/{action}", s.clusterAction)
+	h("GET /api/cluster/transactions/{id}", s.clusterTransaction)
+	if s.Cluster != nil {
+		mux.Handle("/internal/ha/v1", s.Cluster.PeerHandler(s.peerMutation))
+	}
+	h("GET /api/node", s.getNode)
+	h("PUT /api/node", s.putNode)
 	h("POST /api/system/restart", s.restart)
 
 	h("GET /api/rules", s.listRules)
@@ -131,7 +144,7 @@ func (s *Server) routes() http.Handler {
 	})
 	mux.Handle("/", s.static)
 
-	return s.withRecover(s.withHeaders(s.withCORS(s.withAuth(mux))))
+	return s.withRecover(s.withHeaders(s.withCORS(s.withAuth(s.withClusterRules(mux)))))
 }
 
 var publicPaths = map[string]bool{
@@ -183,8 +196,9 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 		if s.boot.API.EnableCors && strings.HasPrefix(r.URL.Path, "/api/") {
 			// Credentials are not allowed cross-origin, so only API tokens work.
 			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Expose-Headers", "ETag, X-Rule-Durability")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, If-Match, Idempotency-Key")
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -241,13 +255,20 @@ func fail(w http.ResponseWriter, code int, errCode, msg string) {
 // failErr maps domain errors to HTTP responses.
 func failErr(w http.ResponseWriter, err error) {
 	var (
-		fe *config.FieldError
-		ce *gateway.ConflictError
-		rl *auth.RateLimitError
+		fe      *config.FieldError
+		ce      *gateway.ConflictError
+		rl      *auth.RateLimitError
+		pending *ha.PendingError
 	)
 	switch {
+	case errors.As(err, &pending):
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "sync_pending", "message": pending.Error(), "updateId": pending.ID})
 	case errors.As(err, &fe):
 		writeJSON(w, http.StatusBadRequest, apiError{"validation", fe.Msg, fe.Field})
+	case errors.Is(err, config.ErrRevisionConflict):
+		fail(w, http.StatusConflict, "conflict", err.Error())
+	case errors.Is(err, config.ErrClusterUnavailable):
+		fail(w, http.StatusServiceUnavailable, "unavailable", err.Error())
 	case errors.As(err, &ce):
 		fail(w, http.StatusConflict, "conflict", ce.Msg)
 	case errors.As(err, &rl):

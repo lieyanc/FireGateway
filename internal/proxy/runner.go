@@ -101,8 +101,9 @@ type Runner struct {
 	Type      string
 	StartedAt time.Time
 
-	pol atomic.Pointer[policy]
-	log *slog.Logger
+	gate func() bool
+	pol  atomic.Pointer[policy]
+	log  *slog.Logger
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -122,7 +123,9 @@ type Runner struct {
 
 // Start binds every mapping of r. Bind failures are recorded, not fatal, so a
 // rule with one busy port in a range still serves the rest.
-func Start(r *config.Rule) (*Runner, error) {
+func Start(r *config.Rule) (*Runner, error) { return StartGuarded(r, nil) }
+
+func StartGuarded(r *config.Rule, gate func() bool) (*Runner, error) {
 	mappings, err := r.Mappings()
 	if err != nil {
 		return nil, err
@@ -132,7 +135,7 @@ func Start(r *config.Rule) (*Runner, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	rn := &Runner{
-		ID: r.ID, Type: r.Type, StartedAt: time.Now(),
+		ID: r.ID, Type: r.Type, StartedAt: time.Now(), gate: gate,
 		log:    slog.With("ruleId", string(r.ID), "type", r.Type),
 		ctx:    ctx,
 		cancel: cancel,
@@ -232,6 +235,9 @@ var connSeq atomic.Uint64
 // admit applies ACL and connection limits and registers a new connection.
 // It returns nil when the connection must be refused.
 func (r *Runner) admit(client netip.AddrPort, listen, target string, closeFn func()) *Conn {
+	if r.gate != nil && !r.gate() {
+		return nil
+	}
 	p := r.policy()
 	ip := client.Addr().Unmap()
 	if !p.allowed(ip) {

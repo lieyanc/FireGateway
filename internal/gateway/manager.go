@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lieyanc/FireGateway/internal/config"
@@ -35,15 +36,19 @@ type Manager struct {
 	store  *config.Store
 	broker *events.Broker
 
-	mu      sync.Mutex // serializes mutations
-	rmu     sync.RWMutex
-	runners map[config.RuleID]*proxy.Runner
-	errs    map[config.RuleID]string // active rules that could not start at all
+	mu         sync.Mutex // serializes mutations
+	rmu        sync.RWMutex
+	runners    map[config.RuleID]*proxy.Runner
+	errs       map[config.RuleID]string // active rules that could not start at all
+	clustered  bool
+	prepared   bool
+	leaseUntil atomic.Pointer[time.Time]
+	applied    atomic.Int64
 }
 
 func New(store *config.Store, broker *events.Broker) *Manager {
 	return &Manager{
-		store: store, broker: broker,
+		store: store, broker: broker, clustered: store.Get().Cluster != nil,
 		runners: make(map[config.RuleID]*proxy.Runner),
 		errs:    make(map[config.RuleID]string),
 	}
@@ -53,6 +58,10 @@ func New(store *config.Store, broker *events.Broker) *Manager {
 func (m *Manager) Start() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.clustered {
+		return
+	}
+	m.prepared = true
 	cfg := m.store.Get()
 	for i := range cfg.Forward {
 		r := &cfg.Forward[i]
@@ -80,16 +89,31 @@ func (m *Manager) Stop() {
 }
 
 func (m *Manager) start(r *config.Rule) {
-	rn, err := proxy.Start(r)
+	if m.clustered && !m.prepared {
+		return
+	}
+	effective, err := m.store.Get().Node.Resolve(*r)
+	var rn *proxy.Runner
+	if err == nil {
+		rn, err = proxy.StartGuarded(&effective, m.Serving)
+	}
 	m.rmu.Lock()
 	defer m.rmu.Unlock()
 	if err != nil {
 		m.errs[r.ID] = err.Error()
+		if m.clustered {
+			expired := time.Time{}
+			m.leaseUntil.Store(&expired)
+		}
 		slog.Error("invalid rule", "ruleId", string(r.ID), "name", r.Name, "err", err)
 		return
 	}
 	delete(m.errs, r.ID)
 	m.runners[r.ID] = rn
+	if m.clustered && (rn.Listeners() == 0 || len(rn.Failures()) > 0) {
+		expired := time.Time{}
+		m.leaseUntil.Store(&expired)
+	}
 }
 
 func (m *Manager) stop(id config.RuleID) {
@@ -113,6 +137,22 @@ func (m *Manager) reconcile(old, next *config.Rule) {
 			m.stop(old.ID)
 		}
 		return
+	}
+	if m.clustered && !m.prepared {
+		return
+	}
+	effective, err := m.store.Get().Node.Resolve(*next)
+	if err != nil {
+		m.stop(next.ID)
+		m.rmu.Lock()
+		m.errs[next.ID] = err.Error()
+		m.rmu.Unlock()
+		return
+	}
+	next = &effective
+	if old != nil {
+		resolved, _ := m.store.Get().Node.Resolve(*old)
+		old = &resolved
 	}
 	rn := m.Runner(next.ID)
 	if rn != nil && old != nil && old.BindKey() == next.BindKey() {
@@ -156,7 +196,7 @@ func (m *Manager) Runtime(r *config.Rule) Runtime { return m.runtime(r, true) }
 func (m *Manager) State(r *config.Rule) string { return m.runtime(r, false).State }
 
 func (m *Manager) runtime(r *config.Rule, withSnapshot bool) Runtime {
-	if !r.Active() {
+	if !r.Active() || (m.clustered && !m.Serving()) {
 		return Runtime{State: StateStopped}
 	}
 	m.rmu.RLock()
@@ -249,7 +289,7 @@ func (m *Manager) Create(r config.Rule) (config.Rule, error) {
 			return &ConflictError{fmt.Sprintf("rule id %q already exists", r.ID)}
 		}
 		c.Forward = append(c.Forward, r)
-		return checkConflicts(c.Forward)
+		return m.validate(c.Forward)
 	})
 	if err != nil {
 		return r, err
@@ -287,7 +327,7 @@ func (m *Manager) replace(id config.RuleID, fn func(*config.Rule) config.Rule) (
 		}
 		old = c.Forward[i]
 		c.Forward[i] = fn(&old)
-		return checkConflicts(c.Forward)
+		return m.validate(c.Forward)
 	})
 	return old, err
 }
@@ -362,7 +402,7 @@ func (m *Manager) Restart(id config.RuleID) (config.Rule, error) {
 		return r, ErrNotFound
 	}
 	m.stop(id)
-	if r.Active() {
+	if r.Active() && (!m.clustered || m.prepared) {
 		m.start(&r)
 	}
 	m.publish("updated", id)
@@ -379,26 +419,46 @@ type BatchFailed struct {
 	Message string `json:"message"`
 }
 
+// Batch validates individual items, then persists all accepted changes in a
+// single publication so a replicated request cannot partially commit twice.
 func (m *Manager) Batch(action string, ids []config.RuleID) (BatchResult, error) {
 	res := BatchResult{OK: []string{}, Failed: []BatchFailed{}}
-	var op func(config.RuleID) error
-	switch action {
-	case "enable", "disable":
-		op = func(id config.RuleID) error { _, err := m.setActive(id, action == "enable"); return err }
-	case "delete":
-		op = m.delete
-	default:
+	if action != "enable" && action != "disable" && action != "delete" {
 		return res, &config.FieldError{Field: "action", Msg: "action must be enable, disable or delete"}
 	}
 	m.mu.Lock()
-	for _, id := range ids {
-		if err := op(id); err != nil {
-			res.Failed = append(res.Failed, BatchFailed{string(id), err.Error()})
-		} else {
+	defer m.mu.Unlock()
+	before := m.List()
+	cfg, err := m.store.Update(func(c *config.Config) error {
+		for _, id := range ids {
+			i := c.RuleIndex(id)
+			if i < 0 {
+				res.Failed = append(res.Failed, BatchFailed{string(id), ErrNotFound.Error()})
+				continue
+			}
+			saved := slices.Clone(c.Forward)
+			if action == "delete" {
+				c.Forward = slices.Delete(slices.Clone(c.Forward), i, i+1)
+			} else {
+				if action == "enable" {
+					c.Forward[i].Status = "active"
+				} else {
+					c.Forward[i].Status = "inactive"
+				}
+			}
+			if err := m.validate(c.Forward); err != nil {
+				c.Forward = saved
+				res.Failed = append(res.Failed, BatchFailed{string(id), err.Error()})
+				continue
+			}
 			res.OK = append(res.OK, string(id))
 		}
+		return nil
+	})
+	if err != nil {
+		return BatchResult{OK: []string{}, Failed: res.Failed}, err
 	}
-	m.mu.Unlock()
+	m.sync(before, cfg.Forward)
 	m.publish("reloaded", "")
 	return res, nil
 }
@@ -454,7 +514,7 @@ func (m *Manager) Import(rules []config.Rule, replace bool) (SyncResult, error) 
 			}
 		}
 		c.Forward = tmp.Forward
-		return checkConflicts(c.Forward)
+		return m.validate(c.Forward)
 	})
 	if err != nil {
 		return SyncResult{}, err
@@ -473,7 +533,20 @@ func (m *Manager) Reload() (SyncResult, *config.Config, error) {
 	if err != nil {
 		return SyncResult{}, nil, err
 	}
-	res := m.sync(old.Forward, cur.Forward)
+	var res SyncResult
+	if !reflect.DeepEqual(old.Node, cur.Node) {
+		for id := range m.Runners() {
+			m.stop(id)
+		}
+		for i := range cur.Forward {
+			if cur.Forward[i].Active() {
+				m.start(&cur.Forward[i])
+			}
+		}
+		res.Updated = len(cur.Forward)
+	} else {
+		res = m.sync(old.Forward, cur.Forward)
+	}
 	slog.Info("configuration reloaded", "added", res.Added, "updated", res.Updated, "removed", res.Removed)
 	m.publish("reloaded", "")
 	return res, cur, nil

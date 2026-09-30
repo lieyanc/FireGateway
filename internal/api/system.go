@@ -25,7 +25,7 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 		listeners += rn.Listeners()
 	}
 	status, code := "healthy", http.StatusOK
-	if listeners == 0 {
+	if listeners == 0 || !s.Manager.Serving() {
 		status, code = "unhealthy", http.StatusServiceUnavailable
 	}
 	var m runtime.MemStats

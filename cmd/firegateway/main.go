@@ -18,6 +18,7 @@ import (
 	"github.com/lieyanc/FireGateway/internal/config"
 	"github.com/lieyanc/FireGateway/internal/events"
 	"github.com/lieyanc/FireGateway/internal/gateway"
+	"github.com/lieyanc/FireGateway/internal/ha"
 	"github.com/lieyanc/FireGateway/internal/logx"
 	"github.com/lieyanc/FireGateway/internal/metrics"
 	"github.com/lieyanc/FireGateway/internal/updater"
@@ -71,6 +72,28 @@ func main() {
 	broker := events.NewBroker()
 	mgr := gateway.New(store, broker)
 	mgr.Start()
+	var cluster *ha.Controller
+	clusterDone := make(chan struct{})
+	if cfg.Cluster != nil {
+		client, err := ha.NewClient(*cfg.Cluster)
+		if err != nil {
+			slog.Error("cluster configuration error", "err", err)
+			os.Exit(1)
+		}
+		peer, peerErr := ha.NewPeerClient(*cfg.Cluster, cfg.Node.ID)
+		if peerErr != nil {
+			slog.Error("peer configuration error", "err", peerErr)
+			os.Exit(1)
+		}
+		cluster, err = ha.NewController(store, mgr, client, peer)
+		if err != nil {
+			slog.Error("cluster recovery failed", "err", err)
+			os.Exit(1)
+		}
+		go func() { defer close(clusterDone); cluster.Run(ctx) }()
+	} else {
+		close(clusterDone)
+	}
 	sampler := metrics.New(mgr, store, broker)
 	go sampler.Run(ctx)
 	authSvc := auth.New(store)
@@ -82,6 +105,7 @@ func main() {
 	shutdown := func() {
 		once.Do(func() {
 			cancel()
+			<-clusterDone
 			if srv != nil {
 				srv.Close()
 			}
@@ -117,7 +141,7 @@ func main() {
 
 	if cfg.API.Enabled {
 		srv, err = api.Start(api.Deps{
-			Store: store, Manager: mgr, Sampler: sampler, Broker: broker, Auth: authSvc, Updater: upd,
+			Store: store, Manager: mgr, Cluster: cluster, Sampler: sampler, Broker: broker, Auth: authSvc, Updater: upd,
 			Started: start, Web: web.FS(),
 			Restart: func() error {
 				err := updater.Restart(beforeExec)

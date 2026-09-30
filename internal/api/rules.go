@@ -52,6 +52,7 @@ func (s *Server) view(r config.Rule) ruleView {
 }
 
 func (s *Server) listRules(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("ETag", `"`+s.Store.Rules().Snapshot().Checksum+`"`)
 	rules := s.Manager.List()
 	items := make([]ruleView, len(rules))
 	for i, r := range rules {

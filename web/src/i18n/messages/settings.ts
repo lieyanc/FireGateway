@@ -9,6 +9,7 @@ export const settings = defineMessages({
       tokens: "API tokens",
       system: "System",
       dns: "DNS",
+      cluster: "Cluster",
       update: "Update",
       about: "About",
     },
@@ -85,7 +86,7 @@ export const settings = defineMessages({
       reload: {
         title: "Configuration file",
         description:
-          "Re-read rules and the log level from the config file on disk, e.g. after editing it by hand.",
+          "Re-read local settings and the standalone rule snapshot. Cluster rules are replicated directly between nodes.",
         action: "Reload from disk",
         success: "Config reloaded",
         summary: "{added} added, {updated} updated, {removed} removed",
@@ -240,6 +241,7 @@ export const settings = defineMessages({
       tokens: "API 令牌",
       system: "系统",
       dns: "DNS",
+      cluster: "主备集群",
       update: "更新",
       about: "关于",
     },
