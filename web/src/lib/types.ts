@@ -278,7 +278,7 @@ export type SettingsUpdateResult = {
 // ---- Update ----
 
 export type UpdateState =
-  "idle" | "checking" | "downloading" | "ready" | "applying" | "failed"
+  "idle" | "checking" | "downloading" | "ready" | "waiting" | "applying" | "failed"
 
 export type UpdateStatus = {
   state: UpdateState

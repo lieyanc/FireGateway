@@ -82,6 +82,7 @@ type Updater struct {
 
 	pendingBinaryPath string
 	pendingTag        string
+	forceApply        chan struct{} // closed to interrupt the current idle wait; guarded by mu
 }
 
 const (
@@ -192,10 +193,20 @@ func (u *Updater) StartUpdate(_ context.Context) {
 }
 
 // ApplyPending installs a downloaded dev-channel update that is waiting in
-// the "ready" state and restarts the process.
-func (u *Updater) ApplyPending(_ context.Context) error {
+// the "ready" state and restarts the process. Force skips the idle wait and
+// can also interrupt an update already waiting for active connections.
+func (u *Updater) ApplyPending(_ context.Context, force bool) error {
 	u.mu.Lock()
 	state := u.status.State
+	if state == "waiting" && force && u.forceApply != nil {
+		select {
+		case <-u.forceApply:
+		default:
+			close(u.forceApply)
+		}
+		u.mu.Unlock()
+		return nil
+	}
 	path := u.pendingBinaryPath
 	tag := u.pendingTag
 
@@ -204,26 +215,53 @@ func (u *Updater) ApplyPending(_ context.Context) error {
 		return fmt.Errorf("no pending update to apply")
 	}
 
-	u.status.State = "applying"
-	u.status.Progress = progressApplying
-	u.status.DownloadProgress = 0
+	forceSignal := u.prepareApplyLocked(force)
 	u.pendingBinaryPath = ""
 	u.pendingTag = ""
 	u.mu.Unlock()
 
-	go func() {
-		// Let the HTTP response go out before the process is replaced.
-		time.Sleep(200 * time.Millisecond)
-		if err := u.waitForIdle(u.bgContext()); err != nil {
-			u.setError("apply canceled while waiting for idle: " + err.Error())
-			return
-		}
-		if err := u.applyUpdate(path, tag); err != nil {
-			u.notifyExecFailure(err)
-			u.setError("apply failed: " + err.Error())
-		}
-	}()
+	go u.applyWhenIdle(u.bgContext(), path, tag, forceSignal)
 	return nil
+}
+
+// prepareApplyLocked reserves a single apply worker for both update channels.
+func (u *Updater) prepareApplyLocked(force bool) <-chan struct{} {
+	u.status.State = "waiting"
+	u.status.Progress = progressVerifyDone
+	u.status.DownloadProgress = 0
+	u.forceApply = make(chan struct{})
+	if force {
+		close(u.forceApply)
+	}
+	return u.forceApply
+}
+
+func (u *Updater) applyWhenIdle(ctx context.Context, path, tag string, force <-chan struct{}) {
+	if err := u.waitForIdle(ctx, force); err != nil {
+		u.setError("apply canceled while waiting for idle: " + err.Error())
+		return
+	}
+	u.mu.Lock()
+	u.status.State = "applying"
+	u.status.Progress = progressApplying
+	u.forceApply = nil
+	u.mu.Unlock()
+
+	// Let the apply (including force-while-waiting) HTTP response go out.
+	timer := time.NewTimer(200 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	if err := ctx.Err(); err != nil {
+		u.setError("apply canceled before restart: " + err.Error())
+		return
+	}
+	if err := u.applyUpdate(path, tag); err != nil {
+		u.notifyExecFailure(err)
+		u.setError("apply failed: " + err.Error())
+	}
 }
 
 // DismissPending discards a downloaded update waiting in the "ready" state.
@@ -308,7 +346,7 @@ func (u *Updater) performUpdate(ctx context.Context) {
 
 	u.mu.Lock()
 	switch u.status.State {
-	case "checking", "ready", "downloading", "applying":
+	case "checking", "ready", "downloading", "waiting", "applying":
 		u.mu.Unlock()
 		return
 	}
@@ -351,18 +389,9 @@ func (u *Updater) performUpdate(ctx context.Context) {
 	// builds wait in "ready" for explicit confirmation.
 	if cfg.Channel == "stable" {
 		u.mu.Lock()
-		u.status.State = "applying"
-		u.status.Progress = progressApplying
-		u.status.DownloadProgress = 0
+		forceSignal := u.prepareApplyLocked(false)
 		u.mu.Unlock()
-		if err := u.waitForIdle(ctx); err != nil {
-			u.setError("apply canceled while waiting for idle: " + err.Error())
-			return
-		}
-		if err := u.applyUpdate(binaryPath, release.TagName); err != nil {
-			u.notifyExecFailure(err)
-			u.setError("apply failed: " + err.Error())
-		}
+		u.applyWhenIdle(ctx, binaryPath, release.TagName, forceSignal)
 		return
 	}
 
@@ -381,6 +410,7 @@ func (u *Updater) setError(msg string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.status.State = "failed"
+	u.forceApply = nil
 	u.status.Error = msg
 	u.status.LastCheck = time.Now().UTC().Format(time.RFC3339)
 }
@@ -409,9 +439,18 @@ func (u *Updater) notifyExecFailure(err error) {
 }
 
 // waitForIdle blocks until the application reports no in-flight work. A
-// canceled application context aborts the update; only the deliberate idle
-// timeout permits applying while work is still reported as active.
-func (u *Updater) waitForIdle(ctx context.Context) error {
+// canceled application context aborts the update; a timeout or an explicit
+// force request permits applying while work is still reported as active.
+func (u *Updater) waitForIdle(ctx context.Context, force <-chan struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-force:
+		u.logger.Warn("update: forced apply requested, skipping idle wait")
+		return ctx.Err()
+	default:
+	}
 	if u.hooks.IsBusy == nil || !u.hooks.IsBusy() {
 		return nil
 	}
@@ -423,12 +462,15 @@ func (u *Updater) waitForIdle(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-force:
+			u.logger.Warn("update: forced apply requested, interrupting idle wait")
+			return ctx.Err()
 		case <-deadline:
 			u.logger.Warn("update: idle wait timed out, applying anyway")
-			return nil
+			return ctx.Err()
 		case <-ticker.C:
 			if !u.hooks.IsBusy() {
-				return nil
+				return ctx.Err()
 			}
 		}
 	}

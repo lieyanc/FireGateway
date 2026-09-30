@@ -277,7 +277,7 @@ export const api = {
   update: {
     status: () => get<UpdateStatus>("/api/update/status"),
     check: () => post<UpdateCheckResult>("/api/update/check"),
-    apply: () => post<Record<string, never>>("/api/update/apply"),
+    apply: (force = false) => post<Record<string, never>>("/api/update/apply", { force }),
     dismiss: () => post<void>("/api/update/dismiss"),
   },
 }

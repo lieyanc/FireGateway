@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"runtime"
@@ -298,8 +300,22 @@ func (s *Server) updateCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) updateApply(w http.ResponseWriter, r *http.Request) {
-	if s.Updater.Status().State == "ready" {
-		if err := s.Updater.ApplyPending(r.Context()); err != nil {
+	var body struct {
+		Force bool `json:"force"`
+	}
+	// An empty body preserves the existing wait-for-idle behavior.
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<10))
+	if err := dec.Decode(&body); err != nil && err != io.EOF {
+		fail(w, http.StatusBadRequest, "bad_request", "invalid JSON: "+err.Error())
+		return
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		fail(w, http.StatusBadRequest, "bad_request", "expected a single JSON object")
+		return
+	}
+	state := s.Updater.Status().State
+	if body.Force || state == "ready" || state == "waiting" {
+		if err := s.Updater.ApplyPending(r.Context(), body.Force); err != nil {
 			fail(w, http.StatusConflict, "conflict", err.Error())
 			return
 		}

@@ -9,6 +9,7 @@ import {
   PackageCheckIcon,
   RefreshCwIcon,
   Trash2Icon,
+  ZapIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 import { z } from "zod"
@@ -56,7 +57,7 @@ import { toastError } from "@/lib/errors"
 import { qk, useSettings, useVersion } from "@/lib/queries"
 import type { Settings, UpdateState, UpdateStatus } from "@/lib/types"
 
-const BUSY_STATES = new Set<UpdateState>(["checking", "downloading", "applying"])
+const BUSY_STATES = new Set<UpdateState>(["checking", "downloading", "waiting", "applying"])
 
 export function UpdateTab() {
   const settings = useSettings()
@@ -151,7 +152,7 @@ function UpdateStatusCard() {
   const apply = useMutation({
     mutationFn: api.update.apply,
     onSuccess: () => {
-      if (status.data?.state === "ready") setRestarting(true)
+      if (status.data?.state === "ready" || status.data?.state === "waiting") setRestarting(true)
       toast.success(t("settings.update.started"))
     },
     onError: (error) => toastError(error, t),
@@ -166,7 +167,7 @@ function UpdateStatusCard() {
   })
 
   const data = status.data
-  const serverDown = status.isError && (restarting || data?.state === "applying")
+  const serverDown = status.isError && (restarting || data?.state === "applying" || data?.state === "waiting")
 
   return (
     <Card>
@@ -234,7 +235,7 @@ function UpdateStatusCard() {
         </Button>
         {data?.state === "ready" ? (
           <>
-            <Button disabled={apply.isPending || serverDown} onClick={() => apply.mutate()}>
+            <Button disabled={apply.isPending || dismiss.isPending || serverDown} onClick={() => apply.mutate(false)}>
               {apply.isPending ? (
                 <Spinner data-icon="inline-start" />
               ) : (
@@ -244,7 +245,7 @@ function UpdateStatusCard() {
             </Button>
             <Button
               variant="ghost"
-              disabled={dismiss.isPending || serverDown}
+              disabled={dismiss.isPending || apply.isPending || serverDown}
               onClick={() => dismiss.mutate()}
             >
               {dismiss.isPending ? (
@@ -259,7 +260,7 @@ function UpdateStatusCard() {
           data &&
           hasNewer(data) &&
           !BUSY_STATES.has(data.state) && (
-            <Button disabled={apply.isPending || serverDown} onClick={() => apply.mutate()}>
+            <Button disabled={apply.isPending || serverDown} onClick={() => apply.mutate(false)}>
               {apply.isPending ? (
                 <Spinner data-icon="inline-start" />
               ) : (
@@ -268,6 +269,20 @@ function UpdateStatusCard() {
               {t("settings.update.updateNow")}
             </Button>
           )
+        )}
+        {(data?.state === "ready" || data?.state === "waiting") && (
+          <Button
+            variant="destructive"
+            disabled={apply.isPending || dismiss.isPending || serverDown}
+            onClick={() => apply.mutate(true)}
+          >
+            {apply.isPending && apply.variables ? (
+              <Spinner data-icon="inline-start" />
+            ) : (
+              <ZapIcon data-icon="inline-start" />
+            )}
+            {t("settings.update.forceApply")}
+          </Button>
         )}
       </CardFooter>
     </Card>
@@ -325,11 +340,22 @@ function StatusDetails({ status }: { status: UpdateStatus }) {
         </Alert>
       )}
 
+      {status.state === "waiting" && (
+        <Alert>
+          <Spinner />
+          <AlertTitle>{t("settings.update.waiting")}</AlertTitle>
+          <AlertDescription>{t("settings.update.forceHint")}</AlertDescription>
+        </Alert>
+      )}
+
       {status.state === "ready" && (
         <Alert>
           <PackageCheckIcon />
           <AlertTitle>{t("settings.update.readyHint")}</AlertTitle>
-          <AlertDescription>{t("settings.update.applyHint")}</AlertDescription>
+          <AlertDescription>
+            <p>{t("settings.update.applyHint")}</p>
+            <p>{t("settings.update.forceHint")}</p>
+          </AlertDescription>
         </Alert>
       )}
 

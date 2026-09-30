@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -432,12 +434,13 @@ func TestSHA256ForTargetExactMatch(t *testing.T) {
 	}
 }
 
-func TestApplyPendingMovesToApplyingBeforeAsyncRestart(t *testing.T) {
+func TestApplyPendingMovesToWaitingBeforeAsyncRestart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
 
 	u := testUpdater(Config{}, "")
 	u.bgCtx = ctx
+	u.hooks.IsBusy = func() bool { return true }
 	u.hooks.BeforeExec = func(tag string) error {
 		return context.Canceled
 	}
@@ -445,16 +448,16 @@ func TestApplyPendingMovesToApplyingBeforeAsyncRestart(t *testing.T) {
 	u.pendingBinaryPath = filepath.Join(t.TempDir(), "firegateway-new")
 	u.pendingTag = "v1.2.0"
 
-	if err := u.ApplyPending(context.Background()); err != nil {
+	if err := u.ApplyPending(context.Background(), false); err != nil {
 		t.Fatalf("ApplyPending returned error: %v", err)
 	}
 
 	status := u.Status()
-	if status.State != "applying" {
-		t.Fatalf("expected state applying immediately, got %q", status.State)
+	if status.State != "waiting" {
+		t.Fatalf("expected state waiting immediately, got %q", status.State)
 	}
-	if status.Progress != progressApplying {
-		t.Fatalf("expected applying progress %d, got %.0f", progressApplying, status.Progress)
+	if status.Progress != progressVerifyDone {
+		t.Fatalf("expected verified progress %d, got %.0f", progressVerifyDone, status.Progress)
 	}
 	u.mu.RLock()
 	consumed := u.pendingBinaryPath == "" && u.pendingTag == ""
@@ -463,25 +466,23 @@ func TestApplyPendingMovesToApplyingBeforeAsyncRestart(t *testing.T) {
 		t.Fatalf("expected pending update to be consumed")
 	}
 
-	err := u.ApplyPending(context.Background())
+	err := u.ApplyPending(context.Background(), false)
 	if err == nil || !strings.Contains(err.Error(), "no pending update") {
 		t.Fatalf("expected duplicate apply to be rejected, got %v", err)
 	}
 
-	// Let the async apply goroutine hit BeforeExec and record the failure.
-	deadline := time.Now().Add(2 * time.Second)
-	for u.Status().State != "failed" && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if s := u.Status(); s.State != "failed" || !strings.Contains(s.Error, "prepare restart") {
-		t.Fatalf("expected apply to fail at BeforeExec, got %+v", s)
+	cancel()
+	if s := waitForUpdateState(t, u, "failed"); !strings.Contains(s.Error, "canceled") {
+		t.Fatalf("expected apply to stop on cancellation, got %+v", s)
 	}
 }
 
 func TestApplyPendingWithoutPendingUpdate(t *testing.T) {
 	u := testUpdater(Config{}, "")
-	if err := u.ApplyPending(context.Background()); err == nil || !strings.Contains(err.Error(), "no pending update") {
-		t.Fatalf("expected no pending update error, got %v", err)
+	for _, force := range []bool{false, true} {
+		if err := u.ApplyPending(context.Background(), force); err == nil || !strings.Contains(err.Error(), "no pending update") {
+			t.Fatalf("expected no pending update error (force=%v), got %v", force, err)
+		}
 	}
 }
 
@@ -491,8 +492,105 @@ func TestWaitForIdleStopsWhenApplicationContextIsCanceled(t *testing.T) {
 	u := testUpdater(Config{}, "")
 	u.hooks.IsBusy = func() bool { return true }
 
-	if err := u.waitForIdle(ctx); err != context.Canceled {
+	if err := u.waitForIdle(ctx, nil); err != context.Canceled {
 		t.Fatalf("waitForIdle error = %v, want context.Canceled", err)
+	}
+}
+
+func waitForUpdateState(t *testing.T, u *Updater, state string) Status {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if status := u.Status(); status.State == state {
+			return status
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s: %+v", state, u.Status())
+	return Status{}
+}
+
+func TestForceApplySkipsOrInterruptsIdleWait(t *testing.T) {
+	for _, forceImmediately := range []bool{false, true} {
+		t.Run(fmt.Sprintf("forceImmediately=%v", forceImmediately), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			u := testUpdater(Config{}, t.TempDir())
+			u.bgCtx = ctx
+			u.status.State = "ready"
+			u.pendingBinaryPath = filepath.Join(t.TempDir(), "new-binary")
+			u.pendingTag = "dev"
+			busyChecked := make(chan struct{}, 1)
+			u.hooks.IsBusy = func() bool {
+				select {
+				case busyChecked <- struct{}{}:
+				default:
+				}
+				return true
+			}
+			var restarts atomic.Int32
+			u.hooks.BeforeExec = func(tag string) error {
+				restarts.Add(1)
+				if tag != "dev" {
+					t.Errorf("restart tag = %q, want dev", tag)
+				}
+				return fmt.Errorf("test stops before exec")
+			}
+			requestCtx, cancelRequest := context.WithCancel(context.Background())
+			cancelRequest() // HTTP request cancellation must not cancel the update.
+			if err := u.ApplyPending(requestCtx, forceImmediately); err != nil {
+				t.Fatal(err)
+			}
+			if !forceImmediately {
+				select {
+				case <-busyChecked:
+				case <-time.After(3 * time.Second):
+					t.Fatal("update never checked active connections")
+				}
+				if u.Status().State != "waiting" || restarts.Load() != 0 {
+					t.Fatal("normal apply did not wait for active connections")
+				}
+				// A background tick must not overwrite the current wait/signal.
+				u.performUpdate(ctx)
+				var requests sync.WaitGroup
+				for range 16 {
+					requests.Add(1)
+					go func() {
+						defer requests.Done()
+						if err := u.ApplyPending(requestCtx, true); err != nil && !strings.Contains(err.Error(), "no pending update") {
+							t.Errorf("force apply: %v", err)
+						}
+					}()
+				}
+				requests.Wait()
+			}
+			status := waitForUpdateState(t, u, "failed")
+			if !strings.Contains(status.Error, "prepare restart") || restarts.Load() != 1 {
+				t.Fatalf("expected exactly one restart, got %d: %+v", restarts.Load(), status)
+			}
+			if forceImmediately && len(busyChecked) != 0 {
+				t.Fatal("forced apply should skip the busy check")
+			}
+		})
+	}
+}
+
+func TestForcedApplyStillHonorsApplicationCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	u := testUpdater(Config{}, t.TempDir())
+	u.bgCtx = ctx
+	u.status.State = "ready"
+	u.pendingBinaryPath = "unused"
+	u.hooks.BeforeExec = func(string) error {
+		t.Error("canceled update reached restart")
+		return fmt.Errorf("test stops before exec")
+	}
+	if err := u.ApplyPending(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if status := waitForUpdateState(t, u, "failed"); !strings.Contains(status.Error, "canceled") {
+		t.Fatalf("expected canceled update, got %+v", status)
 	}
 }
 

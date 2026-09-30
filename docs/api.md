@@ -248,12 +248,12 @@ type Settings = {
 |---|---|
 | `GET /api/update/status` | `UpdateStatus` |
 | `POST /api/update/check` | `{hasUpdate, currentVersion, latestVersion?, isPrerelease, releaseNotes?, channel}` |
-| `POST /api/update/apply` | `202 {}` — if `state=="ready"` applies the pending binary, otherwise starts check+download(+apply on stable) |
+| `POST /api/update/apply` | `202 {}` — optional body `{force?: boolean}`; if `state=="ready"` applies the pending binary, otherwise starts check+download(+apply on stable). `force: true` applies a ready update immediately or interrupts an existing idle wait; other states return `409`. |
 | `POST /api/update/dismiss` | `204` — drops a downloaded pending update |
 
 ```ts
 type UpdateStatus = {
-  state: "idle" | "checking" | "downloading" | "ready" | "applying" | "failed"
+  state: "idle" | "checking" | "downloading" | "ready" | "waiting" | "applying" | "failed"
   currentVersion: string
   latestVersion?: string
   isPrerelease: boolean
@@ -265,4 +265,4 @@ type UpdateStatus = {
 }
 ```
 
-Applying restarts the process; live connections are dropped (the updater first waits up to 10 minutes for active connections to drain). After a restart the UI should detect `currentVersion` changed and reload the page.
+Applying restarts the process; live connections are dropped. By default the updater enters `waiting` and waits up to 10 minutes for active connections to drain, then enters `applying`. Send `{"force":true}` to skip or interrupt that wait for either channel; the downloaded binary must already be verified. An empty body or `{"force":false}` preserves the default behavior (a duplicate non-forced apply during `waiting` returns `409`). Force applies to the current update only and does not change automatic update settings. After a restart the UI should detect `currentVersion` changed and reload the page.
