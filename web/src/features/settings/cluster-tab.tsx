@@ -89,6 +89,7 @@ export function ClusterTab() {
                 [t("cluster.applied"), state.appliedRevision],
                 ...(state.enabled
                   ? [
+                      [t("cluster.initialWriter"), state.initialWriter || "—"],
                       [t("cluster.writer"), state.writer || "—"],
                       [
                         t("cluster.configRole"),
@@ -145,6 +146,13 @@ export function ClusterTab() {
               <AlertDescription>{state.syncError}</AlertDescription>
             </Alert>
           )}
+          {state.enabled && state.upstreamState === "unavailable" && (
+            <Alert>
+              <AlertDescription>
+                {t("cluster.upstreamUnavailableHint")}
+              </AlertDescription>
+            </Alert>
+          )}
           {state.pendingUpdateId && (
             <p className="text-sm text-muted-foreground">
               {t("cluster.pending")}:{" "}
@@ -194,10 +202,13 @@ function ClusterActions({ state }: { state: ClusterStatus }) {
   const queryClient = useQueryClient()
   const [fenced, setFenced] = React.useState(false)
   const [archive, setArchive] = React.useState(false)
+  const failback =
+    state.nodeId === state.initialWriter &&
+    (state.peerTakenOver ||
+      (state.owner !== "" && state.owner !== state.nodeId))
   const action = useMutation({
-    mutationFn: (
-      name: "transfer" | "promote" | "rejoin" | "retrySwitch" | "rearm"
-    ) => api.cluster[name](),
+    mutationFn: (name: "transfer" | "promote" | "rejoin" | "failback") =>
+      api.cluster[name](),
     onSuccess: () => {
       setFenced(false)
       setArchive(false)
@@ -215,9 +226,21 @@ function ClusterActions({ state }: { state: ClusterStatus }) {
       </CardHeader>
       <CardContent>
         <FieldGroup>
-          {state.takenOver && (
+          {state.upstreamState === "switch_pending" && (
+            <Alert>
+              <AlertDescription>
+                {t("cluster.switchPendingHint")}
+              </AlertDescription>
+            </Alert>
+          )}
+          {state.takenOver && state.nodeId !== state.initialWriter && (
             <p className="text-sm text-muted-foreground">
-              {t("cluster.rearmHint")}
+              {t("cluster.takenOverHint")}
+            </p>
+          )}
+          {failback && (
+            <p className="text-sm text-muted-foreground">
+              {t("cluster.failbackHint")}
             </p>
           )}
           <Field orientation="horizontal">
@@ -274,21 +297,17 @@ function ClusterActions({ state }: { state: ClusterStatus }) {
         >
           {t("cluster.rejoin")}
         </Button>
-        {state.upstreamState === "switch_pending" && (
+        {failback && (
           <Button
-            disabled={action.isPending}
-            onClick={() => action.mutate("retrySwitch")}
+            disabled={
+              action.isPending ||
+              state.peerState !== "online" ||
+              state.replicationState !== "synced" ||
+              state.configRole === "read_only"
+            }
+            onClick={() => action.mutate("failback")}
           >
-            {t("cluster.retrySwitch")}
-          </Button>
-        )}
-        {state.takenOver && (
-          <Button
-            variant="outline"
-            disabled={action.isPending || state.replicationState !== "synced"}
-            onClick={() => action.mutate("rearm")}
-          >
-            {t("cluster.rearm")}
+            {t("cluster.failback")}
           </Button>
         )}
         {action.isPending && <Spinner />}

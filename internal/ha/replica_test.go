@@ -2,11 +2,11 @@ package ha
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,6 +55,8 @@ func (w *wire) Call(ctx context.Context, method string, req PeerRequest) (PeerRe
 		err = c.replica.ReceiveHandoff(req.PairID, *req.Handoff, method == "handoff-commit")
 	case "resume":
 		err = c.replica.Resume(req.PairID, req.Checksum, req.Epoch)
+	case "rearm":
+		err = c.rearm(req.PairID, req.Epoch)
 	default:
 		return out, errors.New("unexpected method " + method)
 	}
@@ -69,8 +71,12 @@ type fakeUpstream struct {
 	mu        sync.Mutex
 	address   string
 	count     int
+	calls     int
 	err       error
 	switchErr error
+	// uncertain makes Switch report ErrSwitchUncertain; applied decides
+	// whether the router nevertheless ended up switched.
+	uncertain, applied bool
 }
 
 func (f *fakeUpstream) Read(context.Context) (Ingress, error) {
@@ -81,11 +87,18 @@ func (f *fakeUpstream) Read(context.Context) (Ingress, error) {
 func (f *fakeUpstream) Switch(_ context.Context, in Ingress, ip string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.calls++
 	if f.switchErr != nil {
 		return f.switchErr
 	}
 	if in.Fingerprint != f.address {
 		return errors.New("changed")
+	}
+	if f.uncertain {
+		if f.applied {
+			f.address = ip
+		}
+		return ErrSwitchUncertain
 	}
 	f.address = ip
 	f.count++
@@ -110,7 +123,7 @@ func newPair(t *testing.T) *pair {
 	makeNode := func(id, peer, ip, peerip string, w *wire) *Controller {
 		cfg := config.Default()
 		cfg.Node.ID = id
-		cfg.Cluster = &config.ClusterConfig{ID: "dmz", PeerID: peer, PeerURL: "http://peer", PeerToken: strings.Repeat("test-token", 4), InitialWriter: "a", Address: ip, PeerAddress: peerip, RouterURL: "http://router/ubus", Username: "test", Password: "test-only", Redirects: []string{"dmz"}, PollInterval: 2, FailoverAfter: 10, AllowHTTPPeer: true}
+		cfg.Cluster = &config.ClusterConfig{ID: "dmz", PeerID: peer, PeerPort: 9091, PeerToken: strings.Repeat("test-token", 4), InitialWriter: "a", Address: ip, PeerAddress: peerip, RouterURL: "http://router/ubus", Username: "test", Password: "test-only", Redirects: []string{"dmz"}, PollInterval: 2, FailoverAfter: 10}
 		cfg.Forward = nil
 		if id == "a" {
 			cfg.Forward = []config.Rule{{ID: "web", Type: "tcp", Status: "active", LocalHost: "0.0.0.0", LocalPort: port, TargetHost: "127.0.0.1", TargetPort: 3000}}
@@ -269,12 +282,19 @@ func TestAutomaticFailoverNonpreemptionAndBadPeerCredentials(t *testing.T) {
 		t.Fatalf("backup writable without promotion: %v", err)
 	}
 }
-func TestRouterFailureDoesNotBlockRuleReplication(t *testing.T) {
+func TestRouterFailureKeepsForwardingAndReplication(t *testing.T) {
 	p := newPair(t)
 	bootstrap(t, p)
+	ctx := context.Background()
+	if err := p.a.TrafficStep(ctx); err != nil || !p.a.mgr.Serving() {
+		t.Fatalf("A not active: %v", err)
+	}
 	p.router.err = errors.New("router offline")
-	if err := p.a.TrafficStep(context.Background()); err == nil {
+	if err := p.a.TrafficStep(ctx); err == nil {
 		t.Fatal("router error missing")
+	}
+	if !p.a.mgr.Serving() || p.a.Status().UpstreamState != "unavailable" {
+		t.Fatal("a router API outage stopped forwarding")
 	}
 	r := p.a.replica.state().Committed.Rules[0]
 	r.TargetPort = 4567
@@ -285,6 +305,26 @@ func TestRouterFailureDoesNotBlockRuleReplication(t *testing.T) {
 		t.Fatal("rules depended on router")
 	}
 }
+
+func TestIngressNeverWaitsForReplication(t *testing.T) {
+	p := newPair(t)
+	bootstrap(t, p)
+	// A write stuck on an unresponsive peer holds the write lock for as long
+	// as the peer timeout; the ingress path must not queue behind it.
+	p.a.writes.Lock()
+	defer p.a.writes.Unlock()
+	done := make(chan error, 1)
+	go func() { done <- p.a.TrafficStep(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil || !p.a.mgr.Serving() {
+			t.Fatalf("ingress step failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ingress step waited for the write lock")
+	}
+}
+
 func TestPromotionRejoinAndRejectDivergentEpoch(t *testing.T) {
 	p := newPair(t)
 	bootstrap(t, p)
@@ -320,40 +360,60 @@ func TestPromotionRejoinAndRejectDivergentEpoch(t *testing.T) {
 		t.Fatal("rejoin lost latest rule")
 	}
 }
-func TestPeerHTTPAuthenticationIdentityAndCompactHeartbeat(t *testing.T) {
-	p := newPair(t)
-	bootstrap(t, p)
-	srv := httptest.NewServer(p.b.PeerHandler(func(context.Context, Mutation) Reply { return Reply{Status: 200} }))
-	defer srv.Close()
-	cfg := p.a.cfg
-	cfg.PeerURL = srv.URL
-	client, err := NewPeerClient(cfg, "a")
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := client.Call(context.Background(), "heartbeat", PeerRequest{})
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+func TestNodeLinkMutualTLS(t *testing.T) {
+	p := newPair(t)
+	bootstrap(t, p)
+	port := freePort(t)
+	p.a.cfg.PeerPort, p.b.cfg.PeerPort = port, port
+	if err := p.b.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	call := func(cfg config.ClusterConfig, node string) (PeerResponse, error) {
+		t.Helper()
+		client, err := NewPeerClient(cfg, node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		return client.Call(ctx, "heartbeat", PeerRequest{})
+	}
+	out, err := call(p.a.cfg, "a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if out.Snapshot != nil || out.State == nil || out.State.Checksum == "" {
 		t.Fatal("heartbeat did not return a compact summary")
 	}
-	client.cfg.PeerToken = "bad"
-	if _, err := client.Call(context.Background(), "heartbeat", PeerRequest{}); err == nil {
-		t.Fatal("bad credentials accepted")
+	var fault *PeerFault
+	wrong := p.a.cfg
+	wrong.PeerToken = strings.Repeat("other-token", 4)
+	if _, err = call(wrong, "a"); !errors.As(err, &fault) {
+		t.Fatalf("wrong shared secret is not a configuration fault: %v", err)
 	}
-	client.cfg.PeerToken = cfg.PeerToken
-	client.node = "impostor"
-	if _, err := client.Call(context.Background(), "heartbeat", PeerRequest{}); err == nil {
-		t.Fatal("wrong identity accepted")
+	if _, err = call(p.a.cfg, "impostor"); !errors.As(err, &fault) {
+		t.Fatalf("wrong node identity is not a configuration fault: %v", err)
 	}
-	res, err := http.Get(srv.URL)
-	if err != nil {
-		t.Fatal(err)
+	closed := p.a.cfg
+	closed.PeerPort = freePort(t)
+	if _, err = call(closed, "a"); err == nil || errors.As(err, &fault) {
+		t.Fatalf("an unreachable peer must count as offline: %v", err)
 	}
-	res.Body.Close()
-	if res.StatusCode != 401 {
-		t.Fatal("peer endpoint is public")
+	// Without a certificate from the pair's CA nothing is served.
+	insecure := &http.Client{Timeout: time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	if res, err := insecure.Post("https://"+peerEndpoint("127.0.0.2", port)+"/v1", "application/json", strings.NewReader("{}")); err == nil {
+		res.Body.Close()
+		t.Fatalf("node link answered without a client certificate: %d", res.StatusCode)
 	}
 }
 func TestCorruptJournalAndDuplicateProcessRefused(t *testing.T) {
@@ -422,46 +482,157 @@ func TestWriterHandoffRecoversLostAcknowledgements(t *testing.T) {
 	}
 }
 
-func TestRearmRequiresRestoredReplicationAndManualFailback(t *testing.T) {
+// failover makes A unreachable and lets B take over.
+func failover(t *testing.T, p *pair) {
+	t.Helper()
+	ctx := context.Background()
+	p.ba.offline = true
+	_ = p.b.SyncStep(ctx)
+	p.b.offlineSince = p.b.now().Add(-time.Minute)
+	if err := p.b.TrafficStep(ctx); err != nil && !errors.Is(err, ErrSwitchUncertain) {
+		t.Fatal(err)
+	}
+}
+
+func TestFailbackRestoresPrimaryAndRearmsTakeover(t *testing.T) {
 	p := newPair(t)
 	bootstrap(t, p)
 	ctx := context.Background()
-	if err := p.b.replica.FreezeTakeover(); err != nil {
+	if err := p.a.TrafficStep(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.b.replica.MarkSwitched(); err != nil {
-		t.Fatal(err)
+	failover(t, p)
+	if p.router.address != "127.0.0.2" || !p.b.mgr.Serving() {
+		t.Fatal("B did not take over")
 	}
-	p.router.address = "127.0.0.2"
-	if err := p.b.Rearm(ctx); err == nil {
-		t.Fatal("rearmed while B still owns ingress")
-	}
+	// A returns: it learns about the takeover and does not preempt.
+	p.ba.offline = false
 	if err := p.a.SyncStep(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.a.replica.Transfer(ctx); err != nil {
+	if err := p.a.TrafficStep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p.a.mgr.Serving() || !p.a.replica.state().Frozen || !p.a.Status().PeerTakenOver {
+		t.Fatal("recovered primary did not stand by")
+	}
+	if err := p.b.Action(ctx, "failback", false); err == nil {
+		t.Fatal("failback accepted on the backup")
+	}
+	if err := p.a.Action(ctx, "failback", false); err == nil {
+		t.Fatal("failback accepted before the writer was transferred")
+	}
+	if err := p.a.Action(ctx, "transfer", false); err != nil {
 		t.Fatal(err)
 	}
 	if err := p.b.SyncStep(ctx); err != nil {
 		t.Fatal(err)
 	}
-	p.router.address = "127.0.0.1"
+	if err := p.a.SyncStep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.a.Action(ctx, "failback", false); err != nil {
+		t.Fatal(err)
+	}
+	if p.router.address != "127.0.0.1" || !p.a.mgr.Serving() {
+		t.Fatal("ingress did not return to the primary")
+	}
+	if d := p.b.replica.state(); d.Switched || d.Takeover {
+		t.Fatal("takeover was not re-armed")
+	}
+	if err := p.b.TrafficStep(ctx); err != nil || p.b.mgr.Serving() {
+		t.Fatalf("backup kept forwarding after failback: %v", err)
+	}
+	// B is now the configuration writer: a second takeover keeps it writable.
+	failover(t, p)
+	if p.router.address != "127.0.0.2" || p.b.replica.state().Frozen {
+		t.Fatal("second failover did not work")
+	}
+}
+
+func TestHealthBasedTakeover(t *testing.T) {
+	p := newPair(t)
+	bootstrap(t, p)
+	ctx := context.Background()
 	if err := p.a.TrafficStep(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := p.b.Rearm(ctx); err != nil {
+	// A stays online but can no longer forward the shared rule.
+	wrong := "127.0.0.9"
+	if err := p.a.mgr.UpdateNode(config.NodeConfig{ID: "a", RuleOverrides: map[config.RuleID]config.RuleOverride{"web": {LocalHost: &wrong}}}); err != nil {
 		t.Fatal(err)
 	}
-	if p.b.replica.state().Switched || p.b.replica.state().Takeover {
-		t.Fatal("sticky takeover was not reset")
+	if err := p.a.refresh(); err == nil {
+		t.Fatal("misbound primary reported ready")
 	}
-	p.ba.offline = true
-	_ = p.b.SyncStep(ctx)
-	p.b.offlineSince = time.Now().Add(-time.Minute)
+	if err := p.b.SyncStep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.b.TrafficStep(ctx); err != nil || p.router.calls != 0 {
+		t.Fatalf("took over before failoverAfter: %v", err)
+	}
+	p.b.unhealthySince = time.Now().Add(-time.Minute)
 	if err := p.b.TrafficStep(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if p.router.address != "127.0.0.2" {
-		t.Fatal("second failover did not work")
+	if p.router.address != "127.0.0.2" || !p.b.mgr.Serving() {
+		t.Fatal("healthy backup did not take over from an online but broken primary")
 	}
+}
+
+func TestUncertainSwitchConverges(t *testing.T) {
+	ctx := context.Background()
+	t.Run("applied", func(t *testing.T) {
+		p := newPair(t)
+		bootstrap(t, p)
+		clock := time.Now()
+		p.b.now = func() time.Time { return clock }
+		p.router.uncertain, p.router.applied = true, true
+		failover(t, p)
+		if p.router.address != "127.0.0.2" {
+			t.Fatal("router not switched")
+		}
+		p.router.uncertain = false
+		if err := p.b.TrafficStep(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !p.b.mgr.Serving() || p.b.Status().UpstreamState != "switch_pending" || p.b.replica.state().Switched {
+			t.Fatal("B must forward while OpenWrt may still roll back")
+		}
+		clock = clock.Add(RollbackWindow)
+		if err := p.b.TrafficStep(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if !p.b.replica.state().Switched || p.b.Status().UpstreamState == "switch_pending" || p.router.calls != 1 {
+			t.Fatal("switch did not converge after the rollback window")
+		}
+	})
+	t.Run("rolled back", func(t *testing.T) {
+		p := newPair(t)
+		bootstrap(t, p)
+		clock := time.Now()
+		p.b.now = func() time.Time { return clock }
+		p.router.uncertain = true
+		failover(t, p)
+		p.router.uncertain = false
+		if err := p.b.TrafficStep(ctx); err != nil || p.router.calls != 1 || p.b.mgr.Serving() {
+			t.Fatalf("retried inside the rollback window: %v", err)
+		}
+		// The peer came back: leave ingress with it.
+		clock = clock.Add(RollbackWindow)
+		p.ba.offline = false
+		_ = p.b.SyncStep(ctx)
+		if err := p.b.TrafficStep(ctx); err != nil || p.router.calls != 1 || p.b.Status().UpstreamState != "switch_pending" {
+			t.Fatalf("retried while the peer is healthy: %v", err)
+		}
+		p.ba.offline = true
+		_ = p.b.SyncStep(ctx)
+		p.b.offlineSince = clock.Add(-time.Minute)
+		if err := p.b.TrafficStep(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if p.router.address != "127.0.0.2" || !p.b.replica.state().Switched || !p.b.mgr.Serving() {
+			t.Fatal("switch was not retried while the peer stayed offline")
+		}
+	})
 }

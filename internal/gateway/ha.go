@@ -1,11 +1,11 @@
 package gateway
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"reflect"
-	"time"
 
 	"github.com/lieyanc/FireGateway/internal/config"
 )
@@ -49,52 +49,15 @@ func (m *Manager) ValidateIngress(address string, rules []config.Rule) error {
 	return nil
 }
 
-func (m *Manager) Serving() bool {
-	if !m.clustered {
-		return true
-	}
-	deadline := m.leaseUntil.Load()
-	return deadline != nil && time.Now().Before(*deadline)
-}
-func (m *Manager) Activate(until time.Time, expected ...string) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if len(expected) > 0 && m.store.Rules().Snapshot().Checksum != expected[0] {
-		return false
-	}
-	if len(expected) > 0 {
-		for _, rule := range m.List() {
-			if m.runnable(&rule) {
-				rn := m.Runner(rule.ID)
-				if rn == nil || rn.Listeners() == 0 || len(rn.Failures()) > 0 {
-					return false
-				}
-			}
-		}
-	}
-	m.leaseUntil.Store(&until)
-	return true
-}
-func (m *Manager) LeaseExpired() bool {
-	deadline := m.leaseUntil.Load()
-	return deadline != nil && !time.Now().Before(*deadline)
-}
-func (m *Manager) AppliedRevision() int64 { return m.applied.Load() }
+// Serving reports whether new connections may be forwarded. A standalone
+// node always serves; a clustered node serves only while the router's DNAT
+// points at it.
+func (m *Manager) Serving() bool { return !m.clustered || m.serving.Load() }
 
-// Demote closes the gate before waiting for any configuration mutation.
-func (m *Manager) Demote() {
-	m.leaseUntil.Store(nil)
-	for _, rn := range m.Runners() {
-		rn.CloseAll()
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.prepared = false
-	for id := range m.Runners() {
-		m.stop(id)
-	}
-	m.applied.Store(0)
-}
+// SetServing opens or closes the forwarding gate. Closing refuses new
+// connections only: the router already sends new traffic elsewhere, and
+// established flows finish on the node conntrack still maps them to.
+func (m *Manager) SetServing(on bool) { m.serving.Store(on) }
 
 func (m *Manager) validate(rules []config.Rule) error {
 	node := m.store.Get().Node
@@ -109,8 +72,10 @@ func (m *Manager) validate(rules []config.Rule) error {
 	return checkConflicts(effective)
 }
 
-// Prepare binds every active listener with its forwarding gate still closed.
-// A partial port-range bind makes the entire node ineligible for takeover.
+// Prepare binds every runnable rule without touching the forwarding gate.
+// It is idempotent: bound rules are kept and rules without any listener are
+// retried. The error names rules that cannot bind; the others stay ready, so
+// one bad rule never takes the whole node out of service.
 func (m *Manager) Prepare() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -118,37 +83,24 @@ func (m *Manager) Prepare() error {
 	if err := m.validate(rules); err != nil {
 		return err
 	}
-	active := 0
-	for _, r := range rules {
-		if r.Active() {
-			active++
-		}
-	}
-	if m.clustered && active == 0 {
-		return fmt.Errorf("no active forwarding rules; add or enable a shared rule before takeover")
-	}
 	m.prepared = true
+	var errs []error
 	for i := range rules {
 		r := &rules[i]
 		if !m.runnable(r) {
 			continue
 		}
-		if m.Runner(r.ID) == nil {
+		if rn := m.Runner(r.ID); rn == nil || rn.Listeners() == 0 {
+			m.stop(r.ID)
 			m.start(r)
 		}
-		rn := m.Runner(r.ID)
-		if rn == nil || rn.Listeners() == 0 || len(rn.Failures()) != 0 {
-			m.leaseUntil.Store(nil)
-			m.prepared = false
-			for id := range m.Runners() {
-				m.stop(id)
-			}
-			m.applied.Store(0)
-			return fmt.Errorf("rule %s: cannot bind all listeners on this node", r.ID)
+		// Partially bound rules are reported, not restarted, so retrying never
+		// drops the connections their working listeners carry.
+		if rn := m.Runner(r.ID); rn == nil || rn.Listeners() == 0 || len(rn.Failures()) != 0 {
+			errs = append(errs, fmt.Errorf("rule %s: cannot bind all listeners on this node", r.ID))
 		}
 	}
-	m.applied.Store(m.store.Rules().Snapshot().Revision)
-	return nil
+	return errors.Join(errs...)
 }
 
 func (m *Manager) InstallRules(next config.RuleSet) error {
@@ -177,14 +129,11 @@ func (m *Manager) RestoreRules(next config.RuleSet) error {
 		return err
 	}
 	// Keep desired rules visible even when this node's overrides are invalid,
-	// so the operator can repair them through the UI while forwarding is off.
+	// so the operator can repair them through the UI; rules that do resolve
+	// keep running.
 	defer m.publish("reloaded", "")
-	if err := m.validate(next.Rules); err != nil {
-		return err
-	}
-
 	m.sync(before, next.Rules)
-	return nil
+	return m.validate(next.Rules)
 }
 
 // UpdateNode changes only this node's address overrides, then reapplies them.
@@ -211,13 +160,6 @@ func (m *Manager) UpdateNode(node config.NodeConfig) error {
 	if _, err := m.store.Update(func(c *config.Config) error { c.Node = node; return nil }); err != nil {
 		return err
 	}
-	if m.clustered {
-		m.leaseUntil.Store(nil)
-		m.prepared = false
-		for _, rn := range m.Runners() {
-			rn.CloseAll()
-		}
-	}
 	for i, r := range next.Forward {
 		old, _ := before.Node.Resolve(r)
 		if reflect.DeepEqual(old, effective[i]) {
@@ -228,7 +170,6 @@ func (m *Manager) UpdateNode(node config.NodeConfig) error {
 			m.start(&r)
 		}
 	}
-	m.applied.Store(0)
 	m.publish("reloaded", "")
 	return nil
 }

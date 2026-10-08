@@ -21,11 +21,13 @@ type RuleOverride struct {
 
 // ClusterConfig is read at startup. Credentials and TLS files remain node-local.
 type ClusterConfig struct {
-	ID            string   `json:"id"`
-	PeerID        string   `json:"peerId"`
-	PeerURL       string   `json:"peerUrl"`
-	PeerToken     string   `json:"peerToken"`
-	PeerCAFile    string   `json:"peerCaFile,omitempty"`
+	ID        string `json:"id"`
+	PeerID    string `json:"peerId"`
+	PeerToken string `json:"peerToken"`
+	// PeerPort is the private node-to-node port. Each node listens on its own
+	// LAN Address and dials PeerAddress, so the link bypasses the management
+	// API and any reverse proxy in front of it.
+	PeerPort      int      `json:"peerPort"`
 	InitialWriter string   `json:"initialWriter"`
 	Address       string   `json:"address"`
 	PeerAddress   string   `json:"peerAddress"`
@@ -36,13 +38,11 @@ type ClusterConfig struct {
 	Redirects     []string `json:"redirects"`
 	PollInterval  int      `json:"pollInterval"`
 	FailoverAfter int      `json:"failoverAfter"`
-	// Explicit opt-in for development or a trusted, isolated management LAN.
-	AllowHTTPPeer bool `json:"allowHttpPeer,omitempty"`
 }
 
-func validEndpoint(raw string, httpAllowed bool) bool {
+func validEndpoint(raw string) bool {
 	u, err := url.Parse(raw)
-	return err == nil && u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == "" && (u.Scheme == "https" || (httpAllowed && u.Scheme == "http"))
+	return err == nil && u.Host != "" && u.User == nil && u.RawQuery == "" && u.Fragment == "" && (u.Scheme == "https" || u.Scheme == "http")
 }
 
 func (c *Config) ValidateNode() error {
@@ -86,8 +86,8 @@ func (c *Config) ValidateNode() error {
 		if cc.InitialWriter != c.Node.ID && cc.InitialWriter != cc.PeerID {
 			return &FieldError{"cluster.initialWriter", "must name one member of the pair"}
 		}
-		if !validEndpoint(cc.PeerURL, cc.AllowHTTPPeer) {
-			return &FieldError{"cluster.peerUrl", "use HTTPS; HTTP requires explicit allowHttpPeer on a trusted management network"}
+		if !validPort(cc.PeerPort) || cc.PeerPort == c.API.Port {
+			return &FieldError{"cluster.peerPort", "use a port 1-65535 that differs from the management API port"}
 		}
 		if len(cc.PeerToken) < 32 {
 			return &FieldError{"cluster.peerToken", "use a shared random token of at least 32 characters"}
@@ -101,7 +101,7 @@ func (c *Config) ValidateNode() error {
 		if cc.Address == cc.PeerAddress {
 			return &FieldError{"cluster.peerAddress", "node addresses must differ"}
 		}
-		if !validEndpoint(cc.RouterURL, true) {
+		if !validEndpoint(cc.RouterURL) {
 			return &FieldError{"cluster.routerUrl", "use an http(s) ubus endpoint without embedded credentials"}
 		}
 		if cc.Username == "" || cc.Password == "" {

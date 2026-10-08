@@ -221,8 +221,7 @@ export const api = {
       post<ClusterStatus>("/api/cluster/promote", { fencedPeer: true }),
     rejoin: () =>
       post<ClusterStatus>("/api/cluster/rejoin", { archiveLocal: true }),
-    retrySwitch: () => post<ClusterStatus>("/api/cluster/retry-switch"),
-    rearm: () => post<ClusterStatus>("/api/cluster/rearm"),
+    failback: () => post<ClusterStatus>("/api/cluster/failback"),
   },
   node: {
     get: () => get<NodeInfo>("/api/node"),

@@ -42,11 +42,8 @@ func (s *Server) putClusterConnection(w http.ResponseWriter, r *http.Request) {
 					cc.Password = previous.Password
 				}
 			}
-			// Check local trust files before saving something that would make
-			// the next process fail to start. Constructors perform no I/O to peers.
-			if _, err := ha.NewPeerClient(*cc, body.NodeID); err != nil {
-				return &config.FieldError{Field: "cluster.peerCaFile", Msg: "peer CA file must contain readable PEM certificates"}
-			}
+			// Check the router CA file before saving something that would make
+			// the next process fail to start. The constructor contacts nothing.
 			if _, err := ha.NewClient(*cc); err != nil {
 				return &config.FieldError{Field: "cluster.caFile", Msg: "router CA file must contain readable PEM certificates"}
 			}
@@ -71,7 +68,7 @@ func (s *Server) testPeerConnection(w http.ResponseWriter, r *http.Request) {
 	}
 	client, err := ha.NewPeerClient(*connection.Cluster, connection.NodeID)
 	if err != nil {
-		fail(w, http.StatusBadRequest, "validation", "peer CA file must contain readable PEM certificates")
+		fail(w, http.StatusBadRequest, "validation", err.Error())
 		return
 	}
 	defer client.Close()

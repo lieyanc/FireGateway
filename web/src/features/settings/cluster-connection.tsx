@@ -36,9 +36,8 @@ const queryKey = ["cluster-connection"]
 const defaults: ClusterConnection = {
   id: "",
   peerId: "",
-  peerUrl: "",
+  peerPort: 9091,
   peerToken: "",
-  peerCaFile: "",
   initialWriter: "",
   address: "",
   peerAddress: "",
@@ -49,7 +48,6 @@ const defaults: ClusterConnection = {
   redirects: [],
   pollInterval: 2,
   failoverAfter: 10,
-  allowHttpPeer: false,
 }
 
 export function ClusterConnectionSettings() {
@@ -128,7 +126,7 @@ function ConnectionForm({ info }: { info: ClusterConnectionInfo }) {
   const busy = save.isPending || test.isPending
   type TextKey = Exclude<
     keyof ClusterConnection,
-    "redirects" | "allowHttpPeer" | "pollInterval" | "failoverAfter"
+    "redirects" | "peerPort" | "pollInterval" | "failoverAfter"
   >
   const textField = (
     key: TextKey,
@@ -266,31 +264,44 @@ function ConnectionForm({ info }: { info: ClusterConnectionInfo }) {
                   <FieldGroup className="grid gap-4 sm:grid-cols-2">
                     {textField("address", { placeholder: "192.168.1.10" })}
                     {textField("peerAddress", { placeholder: "192.168.1.11" })}
-                    {textField("peerUrl", {
-                      placeholder: "https://gateway-b:9090",
-                    })}
+                    <Field
+                      data-disabled={busy}
+                      data-invalid={errorField === "cluster.peerPort"}
+                    >
+                      <FieldLabel htmlFor="connection-peerPort">
+                        {t("connection.peerPort")}
+                      </FieldLabel>
+                      <Input
+                        id="connection-peerPort"
+                        type="number"
+                        required
+                        step={1}
+                        min={1}
+                        max={65535}
+                        placeholder="9091"
+                        value={draft.peerPort}
+                        disabled={busy}
+                        aria-invalid={errorField === "cluster.peerPort"}
+                        onChange={(event) => {
+                          setDraft((current) => ({
+                            ...current,
+                            peerPort: Number(event.target.value),
+                          }))
+                          setErrorField("")
+                        }}
+                      />
+                      <FieldDescription>
+                        {t("connection.peerPortHint")}
+                      </FieldDescription>
+                      {errorField === "cluster.peerPort" && (
+                        <FieldError>{fieldMessage}</FieldError>
+                      )}
+                    </Field>
                     {textField("peerToken", {
                       secret: true,
                       configured: info.peerTokenConfigured,
                       hint: t("connection.tokenHint"),
                     })}
-                    {textField("peerCaFile", {
-                      optional: true,
-                      hint: t("connection.caHint"),
-                    })}
-                    <Field orientation="horizontal" data-disabled={busy}>
-                      <Switch
-                        id="connection-http"
-                        checked={draft.allowHttpPeer}
-                        disabled={busy}
-                        onCheckedChange={(allowHttpPeer) =>
-                          setDraft((current) => ({ ...current, allowHttpPeer }))
-                        }
-                      />
-                      <FieldLabel htmlFor="connection-http">
-                        {t("connection.allowHttpPeer")}
-                      </FieldLabel>
-                    </Field>
                   </FieldGroup>
                 </FieldSet>
                 <FieldSet>

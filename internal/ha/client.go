@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/lieyanc/FireGateway/internal/config"
 )
@@ -83,11 +84,11 @@ func (c *Client) rpc(ctx context.Context, session, object, method string, args a
 	}
 	return 0, json.Unmarshal(reply.Result[1], out)
 }
-func (c *Client) login(ctx context.Context) (string, error) {
+func (c *Client) login(ctx context.Context, timeout int) (string, error) {
 	var out struct {
 		Session string `json:"ubus_rpc_session"`
 	}
-	_, err := c.rpc(ctx, "00000000000000000000000000000000", "session", "login", map[string]any{"username": c.cfg.Username, "password": c.cfg.Password, "timeout": 300}, &out)
+	_, err := c.rpc(ctx, "00000000000000000000000000000000", "session", "login", map[string]any{"username": c.cfg.Username, "password": c.cfg.Password, "timeout": timeout}, &out)
 	if err != nil {
 		return "", err
 	}
@@ -127,13 +128,19 @@ func (c *Client) read(ctx context.Context, session string) (Ingress, int, error)
 	in.Fingerprint = digest(b)
 	return in, 0, nil
 }
+
+// Read observes the committed redirects through one cached session, so a
+// poll every few seconds does not create a new rpcd session each time.
 func (c *Client) Read(ctx context.Context) (Ingress, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.observe(ctx)
+}
+func (c *Client) observe(ctx context.Context) (Ingress, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		if c.session == "" {
 			var err error
-			c.session, err = c.login(ctx)
+			c.session, err = c.login(ctx, 300)
 			if err != nil {
 				return Ingress{}, err
 			}
@@ -147,27 +154,35 @@ func (c *Client) Read(ctx context.Context) (Ingress, error) {
 	}
 	return Ingress{}, errors.New("router access denied; existing UCI read permission is required")
 }
+
+// ErrSwitchUncertain reports a switch whose outcome is unknown because apply
+// was already requested: OpenWrt's native rollback timer decides the result.
+var ErrSwitchUncertain = errors.New("upstream switch outcome uncertain")
+
+const rollbackTimeout = 30
+
+// RollbackWindow is how long an unconfirmed apply may still be rolled back.
+const RollbackWindow = (rollbackTimeout + 5) * time.Second
+
+// Switch points every managed redirect at this node: stage in a private
+// session, verify nobody else changed the redirects, apply with native
+// rollback, read back through the observer session, then confirm.
 func (c *Client) Switch(ctx context.Context, expected Ingress, address string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if address != c.cfg.Address {
 		return errors.New("can only switch ingress to this node")
 	}
-	// A new session isolates our staged changes from LuCI and previous failed
-	// calls. Never reauthenticate mid-transaction and lose the staging context.
-	session, err := c.login(ctx)
-	if err != nil {
-		return err
-	}
-	original, _, err := c.read(ctx, session)
+	original, err := c.observe(ctx)
 	if err != nil {
 		return err
 	}
 	if original.Fingerprint != expected.Fingerprint {
 		return errors.New("upstream rules changed before switching")
 	}
-	// A separate read session sees committed configuration, not our staged set.
-	observer, err := c.login(ctx)
+	// A new session isolates our staged changes from LuCI and previous failed
+	// calls. Never reauthenticate mid-transaction and lose the staging context.
+	session, err := c.login(ctx, 120)
 	if err != nil {
 		return err
 	}
@@ -184,9 +199,9 @@ func (c *Client) Switch(ctx context.Context, expected Ingress, address string) e
 	}
 	applied := false
 	defer func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), 2e9)
-		defer cancel()
 		if !applied {
+			cleanup, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
 			_, _ = c.rpc(cleanup, session, "uci", "revert", map[string]any{"config": "firewall"}, nil)
 		}
 		// Do not destroy a rollback session after an uncertain apply/confirm;
@@ -197,20 +212,26 @@ func (c *Client) Switch(ctx context.Context, expected Ingress, address string) e
 			return err
 		}
 	}
-	current, _, err := c.read(ctx, observer)
+	current, err := c.observe(ctx)
 	if err != nil {
 		return err
 	}
 	if current.Fingerprint != original.Fingerprint {
 		return errors.New("upstream rules changed while staging")
 	}
-	if _, err = c.rpc(ctx, session, "uci", "apply", map[string]any{"rollback": true, "timeout": 30}, nil); err != nil {
-		return fmt.Errorf("upstream apply unconfirmed: %w", err)
+	// A ubus status is a definite refusal; a transport error leaves the apply
+	// possibly running on the router.
+	code, err := c.rpc(ctx, session, "uci", "apply", map[string]any{"rollback": true, "timeout": rollbackTimeout}, nil)
+	if code != 0 {
+		return fmt.Errorf("upstream apply refused: %w", err)
 	}
 	applied = true
-	actual, _, err := c.read(ctx, observer)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: apply: %v", ErrSwitchUncertain, err)
+	}
+	actual, err := c.observe(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: read back: %v", ErrSwitchUncertain, err)
 	}
 	desired := clone(original.Values)
 	for _, name := range c.cfg.Redirects {
@@ -218,11 +239,10 @@ func (c *Client) Switch(ctx context.Context, expected Ingress, address string) e
 	}
 	b, _ := json.Marshal(desired)
 	if actual.Fingerprint != digest(b) {
-		return errors.New("upstream configuration verification failed; native rollback remains pending")
+		return fmt.Errorf("%w: read back does not match; native rollback remains pending", ErrSwitchUncertain)
 	}
 	if _, err = c.rpc(ctx, session, "uci", "confirm", map[string]any{}, nil); err != nil {
-		return fmt.Errorf("upstream confirmation uncertain: %w", err)
+		return fmt.Errorf("%w: confirm: %v", ErrSwitchUncertain, err)
 	}
-	c.session = observer
 	return nil
 }

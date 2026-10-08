@@ -3,15 +3,15 @@ package ha
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -19,8 +19,8 @@ import (
 	"github.com/lieyanc/FireGateway/internal/config"
 )
 
-// Protocol 2 adds replicated accounts to snapshots and actors to mutations.
-const Protocol = 2
+// Protocol 3 moves the node link to its own mutual-TLS port.
+const Protocol = 3
 
 const PeerTimeout = 8 * time.Second
 const RouterTimeout = 8 * time.Second
@@ -112,12 +112,23 @@ func secureHTTP(ca string, timeout time.Duration) (*http.Client, error) {
 	}
 	return &http.Client{Transport: t, Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
 }
+
+// NewPeerClient dials the peer's private node port with this node's
+// certificate.
 func NewPeerClient(cfg config.ClusterConfig, node string) (*PeerClient, error) {
-	h, err := secureHTTP(cfg.PeerCAFile, PeerTimeout)
+	_, tlsCfg, err := peerTLS(cfg.PeerToken, cfg.ID, node, cfg.Address, cfg.PeerID)
 	if err != nil {
 		return nil, err
 	}
-	return &PeerClient{cfg: cfg, node: node, http: h}, nil
+	t := &http.Transport{
+		TLSClientConfig:     tlsCfg,
+		ForceAttemptHTTP2:   false,
+		MaxIdleConns:        2,
+		IdleConnTimeout:     time.Minute,
+		TLSHandshakeTimeout: 3 * time.Second,
+		DialContext:         (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 15 * time.Second}).DialContext,
+	}
+	return &PeerClient{cfg: cfg, node: node, http: &http.Client{Transport: t, Timeout: PeerTimeout}}, nil
 }
 
 func (p *PeerClient) Close() { p.http.CloseIdleConnections() }
@@ -127,7 +138,8 @@ func topology(cfg config.ClusterConfig, node string) string {
 		InitialWriter, Router string
 		Nodes                 map[string]string
 		Redirects             []string
-	}{cfg.InitialWriter, cfg.RouterURL, map[string]string{node: cfg.Address, cfg.PeerID: cfg.PeerAddress}, cfg.Redirects})
+		PeerPort              int
+	}{cfg.InitialWriter, cfg.RouterURL, map[string]string{node: cfg.Address, cfg.PeerID: cfg.PeerAddress}, cfg.Redirects, cfg.PeerPort})
 	return digest(b)
 }
 func (p *PeerClient) Call(ctx context.Context, method string, req PeerRequest) (PeerResponse, error) {
@@ -141,26 +153,19 @@ func (p *PeerClient) Call(ctx context.Context, method string, req PeerRequest) (
 	if err != nil {
 		return PeerResponse{}, err
 	}
-	address := strings.TrimRight(p.cfg.PeerURL, "/") + "/internal/ha/v1"
+	address := "https://" + peerEndpoint(p.cfg.PeerAddress, p.cfg.PeerPort) + "/v1"
 	hr, err := http.NewRequestWithContext(ctx, http.MethodPost, address, bytes.NewReader(b))
 	if err != nil {
 		return PeerResponse{}, err
 	}
 	hr.Header.Set("Content-Type", "application/json")
-	hr.Header.Set("Authorization", "Bearer "+p.cfg.PeerToken)
 	res, err := p.http.Do(hr)
 	if err != nil {
-		var cert *tls.CertificateVerificationError
-		var ue *url.Error
-		if errors.As(err, &cert) {
-			return PeerResponse{}, &PeerFault{"peer TLS verification failed"}
-		}
-		if errors.As(err, &ue) {
-			return PeerResponse{}, fmt.Errorf("peer connection failed: %w", ue.Err)
-		}
-		return PeerResponse{}, err
+		return PeerResponse{}, peerFailure(err)
 	}
 	defer res.Body.Close()
+	// Past the handshake only the peer itself can answer, so any malformed
+	// reply is a configuration or version fault, never a sign of an outage.
 	if res.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(res.Body, 256))
 		if text := strings.TrimSpace(string(msg)); text != "" {
@@ -170,6 +175,9 @@ func (p *PeerClient) Call(ctx context.Context, method string, req PeerRequest) (
 	}
 	var out PeerResponse
 	if err = json.NewDecoder(io.LimitReader(res.Body, peerBodyLimit)).Decode(&out); err != nil {
+		if ctx.Err() != nil {
+			return out, fmt.Errorf("peer connection failed: %w", err)
+		}
 		return out, &PeerFault{"invalid peer response"}
 	}
 	if out.Protocol != Protocol || out.NodeID != p.cfg.PeerID {
@@ -187,15 +195,33 @@ func (p *PeerClient) Call(ctx context.Context, method string, req PeerRequest) (
 	}
 	return out, nil
 }
-func (c *Controller) PeerHandler(mutate func(context.Context, Mutation) Reply) http.Handler {
+
+// SetMutator installs the writer-side executor for edits forwarded by the
+// peer. Until it is set, forwarded edits are refused as read-only.
+func (c *Controller) SetMutator(fn func(context.Context, Mutation) Reply) { c.mutator.Store(&fn) }
+
+// Listen serves the node link on this node's LAN address. Call it before Run.
+func (c *Controller) Listen() error {
+	server, _, err := peerTLS(c.cfg.PeerToken, c.cfg.ID, c.node, c.cfg.Address, c.cfg.PeerID)
+	if err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", peerEndpoint(c.cfg.Address, c.cfg.PeerPort))
+	if err != nil {
+		return fmt.Errorf("node link: %w", err)
+	}
+	mux := http.NewServeMux()
+	mux.Handle("POST /v1", c.peerHandler())
+	srv := &http.Server{Handler: mux, TLSConfig: server, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: PeerTimeout, WriteTimeout: 2 * PeerTimeout, IdleTimeout: time.Minute, ErrorLog: log.New(io.Discard, "", 0)}
+	c.server = srv
+	go func() { _ = srv.Serve(tls.NewListener(ln, server)) }()
+	return nil
+}
+
+func (c *Controller) peerHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", "application/json")
-		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if r.Method != http.MethodPost || subtle.ConstantTimeCompare([]byte(auth), []byte(c.cfg.PeerToken)) != 1 {
-			http.Error(w, "node authentication required", http.StatusUnauthorized)
-			return
-		}
 		var req PeerRequest
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, peerBodyLimit))
 		dec.DisallowUnknownFields()
@@ -243,11 +269,14 @@ func (c *Controller) PeerHandler(mutate func(context.Context, Mutation) Reply) h
 			}
 		case "resume":
 			err = c.replica.Resume(req.PairID, req.Checksum, req.Epoch)
+		case "rearm":
+			err = c.rearm(req.PairID, req.Epoch)
 		case "mutate":
-			if req.Mutation == nil || c.replica.state().Writer != c.node {
+			mutate := c.mutator.Load()
+			if req.Mutation == nil || mutate == nil || c.replica.state().Writer != c.node {
 				err = ErrFrozen
 			} else {
-				reply := mutate(r.Context(), *req.Mutation)
+				reply := (*mutate)(r.Context(), *req.Mutation)
 				out.Reply = &reply
 			}
 		default:
@@ -262,6 +291,9 @@ func (c *Controller) PeerHandler(mutate func(context.Context, Mutation) Reply) h
 			if errors.Is(err, config.ErrClusterUnavailable) {
 				out.Code = "unavailable"
 			}
+		} else if req.Method != "heartbeat" && req.Method != "snapshot" && req.Method != "prepare" {
+			// Apply a decided change now instead of at the next poll.
+			c.wake()
 		}
 		_ = json.NewEncoder(w).Encode(out)
 	})

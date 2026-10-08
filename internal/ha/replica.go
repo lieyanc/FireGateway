@@ -407,13 +407,21 @@ func (r *Replica) FreezeTakeover() error {
 	if !d.Paired || d.Transfer != nil {
 		return ErrFrozen
 	}
-	if d.Pending != nil {
-		if err := atomicJSON(r.path+".archive-"+nonce(), d); err != nil {
-			return err
-		}
-		d.Pending = nil
+	if d.Takeover {
+		return nil
 	}
-	d.Frozen = true
+	// A replica fences the absent writer: it archives the request that writer
+	// may never decide and refuses its delayed messages. A node that is itself
+	// the writer keeps its pending request and stays writable.
+	if d.Writer != r.node {
+		if d.Pending != nil {
+			if err := atomicJSON(r.path+".archive-"+nonce(), d); err != nil {
+				return err
+			}
+			d.Pending = nil
+		}
+		d.Frozen = true
+	}
 	d.Takeover = true
 	return r.save(d)
 }
@@ -424,6 +432,7 @@ func (r *Replica) MarkSwitched() error {
 	d.Switched = true
 	return r.save(d)
 }
+
 // Precondition checks a new request against the committed snapshot.
 type Precondition func(committed config.RuleSet) error
 

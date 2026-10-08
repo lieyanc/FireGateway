@@ -95,6 +95,10 @@ func main() {
 			os.Exit(1)
 		}
 		cluster.SetUsage(usage)
+		if err = cluster.Listen(); err != nil {
+			slog.Error("cluster node link failed", "err", err)
+			os.Exit(1)
+		}
 		go func() { defer close(clusterDone); cluster.Run(ctx) }()
 	} else {
 		close(clusterDone)

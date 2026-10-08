@@ -21,9 +21,14 @@ export const cluster = defineMessages({
     initialized: "Nodes paired",
     initHint:
       "Run on the configured initial writer. The peer must be online with empty or matching rules. No data is sent to the router.",
-    rearm: "Rearm backup after manual failback",
-    rearmHint:
-      "After restoring replication, switch ingress back to the initial primary in the router UI, then rearm the backup.",
+    failback: "Fail back to this node",
+    failbackHint:
+      "After the backup took over and the configuration writer has been transferred, move ingress back to this node and re-enable automatic takeover.",
+    takenOverHint:
+      "This node took over ingress. Once the initial primary is back online and replication is synced, transfer the configuration writer, then fail back from the initial primary.",
+    switchPendingHint:
+      "The takeover switch is not yet confirmed. It is retried automatically while the peer stays offline. If the peer has recovered, transfer the configuration writer and then fail back from the initial primary.",
+    initialWriter: "Initial primary",
     writer: "Configuration writer",
     configRole: "Configuration access",
     replication: "Rule replication",
@@ -53,13 +58,14 @@ export const cluster = defineMessages({
     upstream_applied: "Configuration applied",
     upstream_unavailable: "Unavailable",
     upstream_switch_pending: "Switch outcome unconfirmed",
+    upstreamUnavailableHint:
+      "The router API is unreachable. Forwarding continues on the last observed traffic role until the router responds again.",
     actions: "Configuration writer and recovery",
     actionHint:
       "Traffic failover is automatic. Moving configuration write access is a separate action; a recovered node does not reclaim ingress.",
     transfer: "Transfer write access to peer",
     promote: "Promote this node",
     rejoin: "Archive local state and rejoin",
-    retrySwitch: "Retry unconfirmed switch",
     actionDone: "Cluster action completed",
     fenced:
       "I have stopped or isolated the previous writer. I accept local-only saves until replication is restored.",
@@ -103,9 +109,14 @@ export const cluster = defineMessages({
     initialized: "节点已配对",
     initHint:
       "在配置的初始写入节点操作；对端需在线，规则为空或与本机一致。规则直接复制到对端。",
-    rearm: "回切后重新启用自动接管",
-    rearmHint:
-      "恢复双节点同步后，在路由器管理界面将入口改回初始主机，再重新启用备用机自动接管。",
+    failback: "回切到本机",
+    failbackHint:
+      "备用机接管且配置写入权限已移交后，将入口切回本机并重新启用备用机自动接管。",
+    takenOverHint:
+      "本机已接管入口。初始主节点恢复在线且规则同步完成后，请移交配置写入权限，再在初始主节点上执行回切。",
+    switchPendingHint:
+      "接管切换尚未确认。对端保持离线期间会自动重试；如对端已恢复，请先移交配置写入权限，再在初始主节点上执行回切。",
+    initialWriter: "初始主节点",
     writer: "配置写入节点",
     configRole: "配置写入权限",
     replication: "规则同步",
@@ -135,13 +146,14 @@ export const cluster = defineMessages({
     upstream_applied: "已应用目标配置",
     upstream_unavailable: "不可用",
     upstream_switch_pending: "切换结果待确认",
+    upstreamUnavailableHint:
+      "无法访问路由器 API。在路由器恢复响应前，本机按最后一次读取到的流量角色继续转发。",
     actions: "配置写入与恢复",
     actionHint:
       "流量故障切换自动完成，配置写入权限单独移交；旧节点恢复后不抢回入口。",
     transfer: "移交配置写入权限",
     promote: "提升本机为配置主节点",
     rejoin: "归档本机状态并重新加入",
-    retrySwitch: "重试待确认的入口切换",
     actionDone: "集群操作已完成",
     fenced: "我已停止或隔离旧配置主节点，并接受恢复同步前仅在本机保存。",
     archive: "归档本机当前状态，采用对端配置主节点已提交的规则。",

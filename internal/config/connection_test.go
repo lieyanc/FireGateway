@@ -11,7 +11,7 @@ import (
 
 func testConnection() ClusterConnection {
 	return ClusterConnection{NodeID: "a", Cluster: &ClusterConfig{
-		ID: "dmz", PeerID: "b", InitialWriter: "a", PeerURL: "https://peer.example:9090",
+		ID: "dmz", PeerID: "b", InitialWriter: "a", PeerPort: 9091,
 		PeerToken: strings.Repeat("test-only-secret", 3), Address: "192.0.2.10", PeerAddress: "192.0.2.11",
 		RouterURL: "https://router.example/ubus", Username: "test", Password: "test-only-password",
 		Redirects: []string{"dmz"}, PollInterval: 2, FailoverAfter: 10,
@@ -106,7 +106,7 @@ func TestConnectionValidationAndIdentityProtection(t *testing.T) {
 		func(c *ClusterConnection) { c.Cluster.ID = "other" },
 		func(c *ClusterConnection) { c.Cluster.PeerID = "other" },
 		func(c *ClusterConnection) { c.Cluster.InitialWriter = "b" },
-		func(c *ClusterConnection) { c.Cluster.PeerURL = "http://peer.example" },
+		func(c *ClusterConnection) { c.Cluster.PeerPort = 70000 },
 		func(c *ClusterConnection) { c.Cluster.PeerToken = "short" },
 	} {
 		if err := s.UpdateClusterConnection(func(c *ClusterConnection) error { change(c); return nil }); err == nil {
@@ -117,10 +117,10 @@ func TestConnectionValidationAndIdentityProtection(t *testing.T) {
 			t.Fatal("failed validation changed disk")
 		}
 	}
-	if err := s.UpdateClusterConnection(func(c *ClusterConnection) error { c.Cluster.PeerURL = "https://new-peer.example"; return nil }); err != nil {
+	if err := s.UpdateClusterConnection(func(c *ClusterConnection) error { c.Cluster.PeerPort = 9092; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	if s.Get().Cluster.PeerURL != testConnection().Cluster.PeerURL {
+	if s.Get().Cluster.PeerPort != testConnection().Cluster.PeerPort {
 		t.Fatal("running transport changed before restart")
 	}
 }

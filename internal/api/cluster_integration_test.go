@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -34,11 +35,17 @@ func (unusedRouter) Switch(context.Context, ha.Ingress, string) error {
 func TestRulesReplicateThroughAuthenticatedPeerAPI(t *testing.T) {
 	ta := httptest.NewUnstartedServer(nil)
 	tb := httptest.NewUnstartedServer(nil)
-	makeNode := func(id, peer, ip, peerIP string, ts, other *httptest.Server) (*harness, *ha.Controller) {
+	link, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := link.Addr().(*net.TCPAddr).Port
+	link.Close()
+	makeNode := func(id, peer, ip, peerIP string, ts *httptest.Server) (*harness, *ha.Controller) {
 		cfg := config.Default()
 		cfg.Node.ID = id
 		cfg.Forward = nil
-		cfg.Cluster = &config.ClusterConfig{ID: "api-test", PeerID: peer, PeerURL: "http://" + other.Listener.Addr().String(), PeerToken: strings.Repeat("pair-test-token-", 3), Address: ip, PeerAddress: peerIP, InitialWriter: "a", RouterURL: "http://router/ubus", Username: "test", Password: "test-only", Redirects: []string{"dmz"}, PollInterval: 2, FailoverAfter: 10, AllowHTTPPeer: true}
+		cfg.Cluster = &config.ClusterConfig{ID: "api-test", PeerID: peer, PeerPort: port, PeerToken: strings.Repeat("pair-test-token-", 3), Address: ip, PeerAddress: peerIP, InitialWriter: "a", RouterURL: "http://router/ubus", Username: "test", Password: "test-only", Redirects: []string{"dmz"}, PollInterval: 2, FailoverAfter: 10}
 		dir := t.TempDir()
 		path := filepath.Join(dir, "config.json")
 		b, _ := json.Marshal(cfg)
@@ -63,16 +70,23 @@ func TestRulesReplicateThroughAuthenticatedPeerAPI(t *testing.T) {
 		authSvc := auth.New(store)
 		s := &Server{Deps: Deps{Store: store, Manager: mgr, Cluster: ctrl, Auth: authSvc, Broker: broker, Sampler: metrics.New(mgr, store, broker), Started: time.Now()}, boot: store.Get()}
 		s.static = newStaticFS(fstest.MapFS{"index.html": {Data: []byte("app")}})
+		ctrl.SetMutator(s.peerMutation)
+		if err := ctrl.Listen(); err != nil {
+			t.Fatal(err)
+		}
 		ts.Config.Handler = s.routes()
 		ts.Start()
 		t.Cleanup(func() { ts.Close(); mgr.Stop(); ctrl.Close() })
 		jar, _ := cookiejar.New(nil)
 		return &harness{ts: ts, client: &http.Client{Jar: jar}, auth: authSvc, srv: s}, ctrl
 	}
-	a, ca := makeNode("a", "b", "127.0.0.1", "127.0.0.2", ta, tb)
-	b, cb := makeNode("b", "a", "127.0.0.2", "127.0.0.1", tb, ta)
+	a, ca := makeNode("a", "b", "127.0.0.1", "127.0.0.2", ta)
+	b, cb := makeNode("b", "a", "127.0.0.2", "127.0.0.1", tb)
 	a.setup(t)
 	b.setup(t)
+	if code, out := b.do(t, "POST", "/api/cluster/test-peer", ""); code != 200 || out["nodeId"] != "a" {
+		t.Fatalf("peer probe over the node link: %d %v", code, out)
+	}
 	if code, out := a.do(t, "POST", "/api/cluster/bootstrap", ""); code != 200 {
 		t.Fatalf("bootstrap: %d %v", code, out)
 	}
@@ -123,9 +137,9 @@ func TestRulesReplicateThroughAuthenticatedPeerAPI(t *testing.T) {
 	if code, out := a.do(t, "GET", "/api/cluster/transactions/create-request-0001", ""); code != 200 || out["committed"] != true {
 		t.Fatalf("missing transaction receipt: %d %v", code, out)
 	}
-	// Authenticated web users cannot bypass dedicated node authentication.
-	if code, _ := b.do(t, "POST", "/internal/ha/v1", `{"protocol":1}`); code != 401 {
-		t.Fatalf("peer endpoint accepted web cookie: %d", code)
+	// Node-to-node calls are not reachable through the management API.
+	if code, _ := b.do(t, "POST", "/internal/ha/v1", `{"protocol":3}`); code == 200 {
+		t.Fatal("management API serves the node link")
 	}
 	if code, _ := b.do(t, "POST", "/api/cluster/promote", `{"archiveLocal":true}`); code == 200 {
 		t.Fatal("archive confirmation substituted for fencing confirmation")

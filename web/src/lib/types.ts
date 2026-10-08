@@ -392,9 +392,8 @@ export type RulesEvent = {
 export type ClusterConnection = {
   id: string
   peerId: string
-  peerUrl: string
+  peerPort: number
   peerToken: string
-  peerCaFile?: string
   initialWriter: string
   address: string
   peerAddress: string
@@ -405,7 +404,6 @@ export type ClusterConnection = {
   redirects: string[]
   pollInterval: number
   failoverAfter: number
-  allowHttpPeer?: boolean
 }
 export type ClusterConnectionInput = {
   nodeId: string
@@ -453,6 +451,8 @@ export type ClusterStatus = {
   writer: string
   peerEpoch: number
   takenOver: boolean
+  peerTakenOver: boolean
+  initialWriter: string
   configRole: "writer" | "replica" | "read_only"
   replicationState: "waiting" | "local_only" | "pending" | "synced" | "unpaired"
   peerState: "unknown" | "online" | "offline" | "error"

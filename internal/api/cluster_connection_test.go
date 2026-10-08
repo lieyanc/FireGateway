@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,12 +11,11 @@ import (
 	"testing"
 
 	"github.com/lieyanc/FireGateway/internal/config"
-	"github.com/lieyanc/FireGateway/internal/ha"
 )
 
 func connectionRequest() config.ClusterConnection {
 	return config.ClusterConnection{NodeID: "a", Cluster: &config.ClusterConfig{
-		ID: "dmz", PeerID: "b", InitialWriter: "a", PeerURL: "https://peer.example:9090",
+		ID: "dmz", PeerID: "b", InitialWriter: "a", PeerPort: 9091,
 		PeerToken: strings.Repeat("test-only-secret", 3), Address: "192.0.2.10", PeerAddress: "192.0.2.11",
 		RouterURL: "https://router.example/ubus", Username: "test", Password: "test-only-password",
 		Redirects: []string{"dmz"}, PollInterval: 2, FailoverAfter: 10,
@@ -56,7 +56,7 @@ func TestWebConnectionSettingsAuthSecretsAndPersistence(t *testing.T) {
 	}
 	// Redaction must not modify stored secrets. A second edit preserves them.
 	body.Cluster.PeerToken, body.Cluster.Password = "", ""
-	body.Cluster.PeerURL = "https://changed-peer.example"
+	body.Cluster.PeerPort = 9092
 	if code, out := h.do(t, "PUT", "/api/cluster/config", encodeConnection(t, body)); code != 200 {
 		t.Fatalf("retain secrets: %d %v", code, out)
 	}
@@ -76,15 +76,15 @@ func TestWebConnectionSettingsAuthSecretsAndPersistence(t *testing.T) {
 	if err := json.Unmarshal(disk, &saved); err != nil {
 		t.Fatal(err)
 	}
-	if saved.Cluster.PeerToken != connectionRequest().Cluster.PeerToken || saved.Cluster.Password != connectionRequest().Cluster.Password || saved.Cluster.PeerURL != body.Cluster.PeerURL {
+	if saved.Cluster.PeerToken != connectionRequest().Cluster.PeerToken || saved.Cluster.Password != connectionRequest().Cluster.Password || saved.Cluster.PeerPort != body.Cluster.PeerPort {
 		t.Fatal("secret retention or save failed")
 	}
 	// Invalid drafts fail before persistence, including local CA checks.
 	for _, mutate := range []func(*config.ClusterConnection){
 		func(c *config.ClusterConnection) { c.NodeID = "invalid id" },
 		func(c *config.ClusterConnection) { c.Cluster.ID = "invalid id" },
-		func(c *config.ClusterConnection) { c.Cluster.PeerURL = "http://peer.example" },
-		func(c *config.ClusterConnection) { c.Cluster.PeerCAFile = t.TempDir() + "/missing.pem" },
+		func(c *config.ClusterConnection) { c.Cluster.PeerPort = 70000 },
+		func(c *config.ClusterConnection) { c.Cluster.PeerPort = config.Default().API.Port },
 		func(c *config.ClusterConnection) { c.Cluster.CAFile = t.TempDir() + "/missing.pem" },
 	} {
 		bad := connectionRequest()
@@ -114,43 +114,26 @@ func TestWebPeerProbeUsesSavedSettingsWithoutMutations(t *testing.T) {
 	if code, _ := h.do(t, "POST", "/api/cluster/test-peer", ""); code != 400 {
 		t.Fatal("test accepted absent settings")
 	}
-	var peerCalls, routerCalls atomic.Int32
-	var wrongIdentity atomic.Bool
-	body := connectionRequest()
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		peerCalls.Add(1)
-		var req ha.PeerRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Error(err)
-		}
-		if r.URL.Path != "/internal/ha/v1" || req.Method != "heartbeat" || req.NodeID != "a" || req.Receiver != "b" || req.ClusterID != "dmz" || r.Header.Get("Authorization") != "Bearer "+connectionRequest().Cluster.PeerToken {
-			t.Error("invalid test request or credentials")
-		}
-		id := "b"
-		if wrongIdentity.Load() {
-			id = "impostor"
-		}
-		_ = json.NewEncoder(w).Encode(ha.PeerResponse{Protocol: ha.Protocol, NodeID: id, State: &ha.PeerState{NodeID: id}})
-	}))
-	defer peer.Close()
+	var routerCalls atomic.Int32
 	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { routerCalls.Add(1); w.WriteHeader(500) }))
 	defer router.Close()
-	body.Cluster.PeerURL, body.Cluster.RouterURL, body.Cluster.AllowHTTPPeer = peer.URL, router.URL, true
+	// Nothing listens on the peer's node port: the probe reports it offline.
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := connectionRequest()
+	body.Cluster.Address, body.Cluster.PeerAddress = "127.0.0.2", "127.0.0.1"
+	body.Cluster.PeerPort, body.Cluster.RouterURL = closed.Addr().(*net.TCPAddr).Port, router.URL
+	closed.Close()
 	if code, out := h.do(t, "PUT", "/api/cluster/config", encodeConnection(t, body)); code != 200 {
 		t.Fatalf("save: %d %v", code, out)
 	}
-	if peerCalls.Load() != 0 || routerCalls.Load() != 0 {
-		t.Fatal("saving settings contacted a device")
+	if code, out := h.do(t, "POST", "/api/cluster/test-peer", ""); code != 502 || out["error"] != "peer_unavailable" {
+		t.Fatalf("probe of an absent peer: %d %v", code, out)
 	}
-	if code, out := h.do(t, "POST", "/api/cluster/test-peer", ""); code != 200 || out["connected"] != true || out["nodeId"] != "b" {
-		t.Fatalf("probe: %d %v", code, out)
-	}
-	wrongIdentity.Store(true)
-	if code, _ := h.do(t, "POST", "/api/cluster/test-peer", ""); code != 502 {
-		t.Fatal("accepted mismatched peer identity")
-	}
-	if peerCalls.Load() != 2 || routerCalls.Load() != 0 {
-		t.Fatal("probe did more than peer heartbeat")
+	if routerCalls.Load() != 0 {
+		t.Fatal("probe contacted the router")
 	}
 	if _, out := h.do(t, "GET", "/api/cluster/config", ""); out["restartRequired"] != true {
 		t.Fatal("probe applied pending configuration")

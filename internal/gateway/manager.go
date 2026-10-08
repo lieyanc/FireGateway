@@ -42,15 +42,14 @@ type Manager struct {
 	store  *config.Store
 	broker *events.Broker
 
-	mu         sync.Mutex // serializes mutations
-	rmu        sync.RWMutex
-	runners    map[config.RuleID]*proxy.Runner
-	errs       map[config.RuleID]string // active rules that could not start at all
-	clustered  bool
-	prepared   bool
-	leaseUntil atomic.Pointer[time.Time]
-	applied    atomic.Int64
-	suspended  atomic.Pointer[map[string]bool] // tenants over their traffic quota
+	mu        sync.Mutex // serializes mutations
+	rmu       sync.RWMutex
+	runners   map[config.RuleID]*proxy.Runner
+	errs      map[config.RuleID]string // active rules that could not start at all
+	clustered bool
+	prepared  bool                            // clustered: runners may bind; set by the first Prepare
+	serving   atomic.Bool                     // clustered: the forwarding gate, see SetServing
+	suspended atomic.Pointer[map[string]bool] // tenants over their traffic quota
 }
 
 func New(store *config.Store, broker *events.Broker) *Manager {
@@ -108,19 +107,11 @@ func (m *Manager) start(r *config.Rule) {
 	defer m.rmu.Unlock()
 	if err != nil {
 		m.errs[r.ID] = err.Error()
-		if m.clustered {
-			expired := time.Time{}
-			m.leaseUntil.Store(&expired)
-		}
 		slog.Error("invalid rule", "ruleId", string(r.ID), "name", r.Name, "err", err)
 		return
 	}
 	delete(m.errs, r.ID)
 	m.runners[r.ID] = rn
-	if m.clustered && (rn.Listeners() == 0 || len(rn.Failures()) > 0) {
-		expired := time.Time{}
-		m.leaseUntil.Store(&expired)
-	}
 }
 
 func (m *Manager) stop(id config.RuleID) {

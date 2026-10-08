@@ -101,14 +101,7 @@ func (s *Server) clusterAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	var err error
-	if action == "rearm" {
-		err = s.Cluster.Rearm(r.Context())
-	} else if action == "retry-switch" {
-		err = s.Cluster.RetrySwitch(r.Context())
-	} else {
-		err = s.Cluster.Action(r.Context(), action, (action == "promote" && body.FencedPeer) || (action == "rejoin" && body.ArchiveLocal))
-	}
+	err := s.Cluster.Action(r.Context(), action, (action == "promote" && body.FencedPeer) || (action == "rejoin" && body.ArchiveLocal))
 	if err != nil {
 		failErr(w, err)
 		return

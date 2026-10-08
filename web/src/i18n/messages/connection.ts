@@ -19,16 +19,16 @@ export const connection = defineMessages({
       "Enter one of the two node IDs. The other node is the automatic backup.",
     peer: "Peer connection",
     peerHint:
-      "Rules synchronize directly between the gateways. LAN addresses identify the destinations used by the upstream router.",
+      "Rules and heartbeats travel directly between the LAN addresses below over a dedicated encrypted link, not through the management interface or a reverse proxy. These addresses are also the destinations used by the upstream router.",
     address: "This node LAN IPv4",
     peerAddress: "Peer LAN IPv4",
-    peerUrl: "Peer management URL",
+    peerPort: "Peer link port",
+    peerPortHint:
+      "Private node-to-node port on the LAN addresses above; default 9091. Use the same value on both nodes and a different port from the management interface. Allow it in the firewall only between the two nodes.",
     peerToken: "Shared peer secret",
     tokenHint:
-      "Use the same random secret of at least 32 characters on both nodes. Change it on both nodes together.",
-    peerCaFile: "Peer CA certificate path (optional)",
+      "Use the same random secret of at least 32 characters on both nodes. It also encrypts and authenticates the peer link, so no certificate files are needed. Change it on both nodes together.",
     caHint: "Path on this gateway. Leave empty to use the system trust store.",
-    allowHttpPeer: "Allow HTTP on an isolated management network",
     upstream: "Upstream OpenWrt",
     upstreamHint:
       "Use the router’s existing API and named forwarding rules. Saving or testing this form does not change the router.",
@@ -66,16 +66,17 @@ export const connection = defineMessages({
     initialWriter: "初始主节点 ID",
     writerHint: "填写两台节点之一的 ID，另一台作为自动接管的备用机。",
     peer: "对端连接",
-    peerHint: "规则直接在网关之间同步。LAN 地址用于上游路由器转发目标。",
+    peerHint:
+      "规则和心跳通过专用加密链路在下方 LAN 地址之间直接传输，不经过管理界面或反向代理。这些地址同时也是上游路由器的转发目标。",
     address: "本机 LAN IPv4",
     peerAddress: "对端 LAN IPv4",
-    peerUrl: "对端管理地址",
+    peerPort: "节点互联端口",
+    peerPortHint:
+      "在上方 LAN 地址上监听的节点间专用端口，默认 9091。两台节点需使用相同端口，且不能与管理界面端口相同；防火墙仅允许两台节点之间访问该端口。",
     peerToken: "节点共享密钥",
     tokenHint:
-      "两台节点使用相同的随机密钥，至少 32 个字符；更换时需要同步修改两台节点。",
-    peerCaFile: "对端 CA 证书路径（可选）",
+      "两台节点使用相同的随机密钥，至少 32 个字符；该密钥同时用于节点互联链路的加密与双向认证，无需证书文件。更换时需要同步修改两台节点。",
     caHint: "填写本机上的证书路径；留空则使用系统信任的证书。",
-    allowHttpPeer: "允许在隔离管理网络中使用 HTTP",
     upstream: "上游 OpenWrt",
     upstreamHint:
       "使用路由器已有 API 和已命名的转发规则。保存或测试此表单不会修改路由器。",

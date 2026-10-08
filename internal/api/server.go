@@ -50,6 +50,11 @@ type Server struct {
 func Start(d Deps) (*Server, error) {
 	s := &Server{Deps: d, boot: d.Store.Get()}
 	s.static = newStaticFS(d.Web)
+	if d.Cluster != nil {
+		// Edits forwarded by the peer over the node link run here when this
+		// node is the configuration writer.
+		d.Cluster.SetMutator(s.peerMutation)
+	}
 	c := s.boot.API
 	addr := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 	ln, err := net.Listen("tcp", addr)
@@ -98,9 +103,6 @@ func (s *Server) routes() http.Handler {
 	a("POST /api/cluster/bootstrap", s.clusterBootstrap)
 	a("POST /api/cluster/{action}", s.clusterAction)
 	a("GET /api/cluster/transactions/{id}", s.clusterTransaction)
-	if s.Cluster != nil {
-		mux.Handle("/internal/ha/v1", s.Cluster.PeerHandler(s.peerMutation))
-	}
 	a("GET /api/node", s.getNode)
 	a("PUT /api/node", s.putNode)
 	a("POST /api/system/restart", s.restart)

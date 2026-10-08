@@ -3,6 +3,7 @@ package ha
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -124,6 +125,12 @@ func TestNativeOpenWrtSwitchPreservesOtherRules(t *testing.T) {
 	if f.values["dmz"]["dest_ip"] != c.cfg.Address || f.values["unrelated"]["dest_ip"] != "192.168.1.99" || f.values["dmz"]["src"] != "wan" {
 		t.Fatal("switch changed unrelated configuration")
 	}
+	if f.serial != 3 {
+		t.Fatalf("switch should reuse the read session and open one staging session, got %d logins", f.serial)
+	}
+	if _, err = c.Read(ctx); err != nil || f.serial != 3 {
+		t.Fatal("polling opened a new router session")
+	}
 	allowed := map[string]bool{"session.login": true, "uci.get": true, "uci.set": true, "uci.changes": true, "uci.apply": true, "uci.confirm": true, "uci.revert": true}
 	for _, method := range f.calls {
 		if !allowed[method] {
@@ -150,15 +157,15 @@ func TestNativeSwitchRejectsConcurrentAndUnconfirmedChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.deny = "apply"
-	if err = c.Switch(ctx, in, c.cfg.Address); err == nil {
-		t.Fatal("failed apply was acknowledged")
+	if err = c.Switch(ctx, in, c.cfg.Address); err == nil || errors.Is(err, ErrSwitchUncertain) {
+		t.Fatalf("a refused apply must be a definite failure: %v", err)
 	}
 	if f.values["dmz"]["dest_ip"] == c.cfg.Address {
 		t.Fatal("staging changed committed config")
 	}
 	f.deny = "confirm"
-	if err = c.Switch(ctx, in, c.cfg.Address); err == nil {
-		t.Fatal("failed confirm was acknowledged")
+	if err = c.Switch(ctx, in, c.cfg.Address); !errors.Is(err, ErrSwitchUncertain) {
+		t.Fatalf("a failed confirm must leave the outcome to OpenWrt's rollback: %v", err)
 	}
 }
 func TestUnexpectedDestinationCannotBeClaimed(t *testing.T) {

@@ -153,6 +153,9 @@ func (c *Config) applyDefaults() {
 		if c.Cluster.FailoverAfter == 0 {
 			c.Cluster.FailoverAfter = 10
 		}
+		if c.Cluster.PeerPort == 0 {
+			c.Cluster.PeerPort = 9091
+		}
 	}
 	if c.Forward == nil {
 		c.Forward = []Rule{}
