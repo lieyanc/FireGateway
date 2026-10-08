@@ -14,6 +14,7 @@ const RuleDetailPage = lazy(() => import("@/pages/rule-detail"))
 const ConnectionsPage = lazy(() => import("@/pages/connections"))
 const TrafficPage = lazy(() => import("@/pages/traffic"))
 const LogsPage = lazy(() => import("@/pages/logs"))
+const AccessPage = lazy(() => import("@/pages/access"))
 const SettingsPage = lazy(() => import("@/pages/settings"))
 const NotFoundPage = lazy(() => import("@/pages/not-found"))
 
@@ -63,6 +64,11 @@ export const router = createBrowserRouter([
             path: "logs",
             element: <LogsPage />,
             handle: handle({ section: "shell.nav.logs" }),
+          },
+          {
+            path: "access/:tab?",
+            element: <AccessPage />,
+            handle: handle({ section: "shell.nav.access" }),
           },
           {
             path: "settings/:tab?",

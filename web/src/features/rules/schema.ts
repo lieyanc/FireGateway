@@ -90,6 +90,8 @@ export type RuleFormValues = {
   maxConnectionsPerIp: string
   bandwidth: string
   bandwidthUnit: BandwidthUnit
+  /** Owning tenant id, "" for none; only administrators can change it. */
+  owner: string
 }
 
 const UNIT_BYTES: Record<BandwidthUnit, number> = { KB: 1024, MB: 1024 * 1024 }
@@ -142,6 +144,7 @@ export const emptyRuleForm: RuleFormValues = {
   maxConnectionsPerIp: "",
   bandwidth: "",
   bandwidthUnit: "MB",
+  owner: "",
 }
 
 function bandwidthToForm(bytes?: number): { value: string; unit: BandwidthUnit } {
@@ -179,6 +182,7 @@ export function ruleToForm(rule: Rule): RuleFormValues {
     maxConnectionsPerIp: str(rule.limits?.maxConnectionsPerIp),
     bandwidth: bw.value,
     bandwidthUnit: bw.unit,
+    owner: rule.owner ?? "",
   }
 }
 
@@ -191,6 +195,8 @@ export function formToRule(values: RuleFormValues, id: string): Rule {
     status: values.enabled ? "active" : "inactive",
     localHost: normalizeHost(values.localHost),
     targetHost: normalizeHost(values.targetHost),
+    // Sent even when empty: an update without it keeps the current owner.
+    owner: values.owner,
   }
   if (values.mode === "single") {
     rule.localPort = parsePort(values.localPort) ?? undefined
@@ -238,6 +244,7 @@ export function makeRuleSchema(t: Translate) {
       maxConnectionsPerIp: text,
       bandwidth: text,
       bandwidthUnit: z.enum(["KB", "MB"]),
+      owner: text,
     })
     .superRefine((v, ctx) => {
       const issue = (path: keyof RuleFormValues, message: string) =>
@@ -313,6 +320,7 @@ export function serverFieldToForm(
     case "localHost":
     case "targetHost":
     case "remark":
+    case "owner":
       return { name: base }
     case "status":
       return { name: "enabled" }

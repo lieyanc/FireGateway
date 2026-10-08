@@ -21,6 +21,7 @@ import (
 	"github.com/lieyanc/FireGateway/internal/ha"
 	"github.com/lieyanc/FireGateway/internal/logx"
 	"github.com/lieyanc/FireGateway/internal/metrics"
+	"github.com/lieyanc/FireGateway/internal/quota"
 	"github.com/lieyanc/FireGateway/internal/updater"
 	"github.com/lieyanc/FireGateway/internal/version"
 	"github.com/lieyanc/FireGateway/web"
@@ -31,7 +32,7 @@ const summaryInterval = 5 * time.Minute
 func main() {
 	cfgPath := flag.String("c", "config.json", "path to config file (created or completed from the default template)")
 	showVersion := flag.Bool("v", false, "print version and exit")
-	resetAuth := flag.Bool("reset-auth", false, "remove the admin account and API tokens, then exit")
+	resetAuth := flag.Bool("reset-auth", false, "enable account recovery on this node, then exit; the next start prints a setup token that can create or reset an administrator")
 	flag.Parse()
 	if *showVersion {
 		fmt.Printf("FireGateway %s (commit %s, built %s)\n", version.Version, version.Commit, version.BuildTime)
@@ -46,11 +47,11 @@ func main() {
 		os.Exit(1)
 	}
 	if *resetAuth {
-		if _, err := store.Update(func(c *config.Config) error { c.Auth = config.AuthConfig{}; return nil }); err != nil {
+		if _, err := store.Update(func(c *config.Config) error { c.Auth.Recovery = true; return nil }); err != nil {
 			fmt.Fprintln(os.Stderr, "reset failed:", err)
 			os.Exit(1)
 		}
-		fmt.Println("Admin account removed. Restart FireGateway and set it up again in the web UI.")
+		fmt.Println("Account recovery enabled. Restart FireGateway, open the web UI and enter the setup token it logs to create or reset an administrator.")
 		return
 	}
 	cfg := store.Get()
@@ -71,6 +72,9 @@ func main() {
 	defer cancel()
 	broker := events.NewBroker()
 	mgr := gateway.New(store, broker)
+	usage := quota.New(store, cfg.DataDir)
+	// Tenants already over quota stay down from the start.
+	mgr.SetSuspended(usage.Over())
 	mgr.Start()
 	var cluster *ha.Controller
 	clusterDone := make(chan struct{})
@@ -90,13 +94,28 @@ func main() {
 			slog.Error("cluster recovery failed", "err", err)
 			os.Exit(1)
 		}
+		cluster.SetUsage(usage)
 		go func() { defer close(clusterDone); cluster.Run(ctx) }()
 	} else {
 		close(clusterDone)
 	}
 	sampler := metrics.New(mgr, store, broker)
+	sampler.Usage = usage.Add
 	go sampler.Run(ctx)
+	go usage.Run(ctx, mgr.SetSuspended)
 	authSvc := auth.New(store)
+	if cluster == nil {
+		// Standalone nodes own their accounts and migrate them right away;
+		// clusters migrate through the writer once the API is up.
+		if migrated, err := authSvc.Migrate(); err != nil {
+			slog.Error("failed to migrate the admin account", "err", err)
+		} else if migrated {
+			slog.Info("admin account migrated to multi-user accounts")
+		}
+		if err := authSvc.DropLegacy(); err != nil {
+			slog.Error("failed to remove the migrated admin account from the node config", "err", err)
+		}
+	}
 
 	var srv *api.Server
 	var once sync.Once
@@ -112,6 +131,9 @@ func main() {
 			mgr.Stop()
 			if err := sampler.Save(); err != nil {
 				slog.Warn("failed to save metrics history", "err", err)
+			}
+			if err := usage.Save(); err != nil {
+				slog.Warn("failed to save tenant usage", "err", err)
 			}
 			slog.Info("shutdown complete")
 			logCloser.Close()
@@ -141,7 +163,7 @@ func main() {
 
 	if cfg.API.Enabled {
 		srv, err = api.Start(api.Deps{
-			Store: store, Manager: mgr, Cluster: cluster, Sampler: sampler, Broker: broker, Auth: authSvc, Updater: upd,
+			Store: store, Manager: mgr, Cluster: cluster, Sampler: sampler, Broker: broker, Auth: authSvc, Quota: usage, Updater: upd,
 			Started: start, Web: web.FS(),
 			Restart: func() error {
 				err := updater.Restart(beforeExec)
@@ -153,9 +175,18 @@ func main() {
 		})
 		if err != nil {
 			slog.Error("failed to start web UI / API server", "err", err)
-		} else if tok := authSvc.SetupToken(); tok != "" {
-			url := "http://" + net.JoinHostPort(cfg.API.Host, strconv.Itoa(cfg.API.Port))
-			slog.Warn("admin account not set up yet: open the web UI and enter this setup token", "url", url, "setupToken", tok)
+		} else {
+			if cluster != nil {
+				go srv.MigrateAccounts(ctx)
+			}
+			if tok := authSvc.SetupToken(); tok != "" {
+				url := "http://" + net.JoinHostPort(cfg.API.Host, strconv.Itoa(cfg.API.Port))
+				if store.Local().Auth.Recovery {
+					slog.Warn("account recovery enabled: open the web UI and enter this setup token to create or reset an administrator", "url", url, "setupToken", tok)
+				} else {
+					slog.Warn("admin account not set up yet: open the web UI and enter this setup token", "url", url, "setupToken", tok)
+				}
+			}
 		}
 	}
 

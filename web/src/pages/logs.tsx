@@ -49,7 +49,7 @@ import { MAX_LOG_ENTRIES, useLogTail, type TailStatus } from "@/features/log-tai
 import { useI18n, type MessageKey } from "@/i18n"
 import { api } from "@/lib/api"
 import { errorMessage, toastError } from "@/lib/errors"
-import { qk, useLogLevel } from "@/lib/queries"
+import { qk, useLogLevel, useSession } from "@/lib/queries"
 import type { LogEntry, LogLevel } from "@/lib/types"
 
 const LEVELS = ["error", "warn", "info", "debug", "trace"] as const
@@ -130,6 +130,24 @@ function ServerLevelSelect() {
       </TooltipTrigger>
       <TooltipContent>{t("logs.serverLevelHint")}</TooltipContent>
     </Tooltip>
+  )
+}
+
+/** Read-only level for members; only administrators may change it. */
+function ServerLevelBadge() {
+  const { t } = useI18n()
+  const label = useLevelLabel()
+  const query = useLogLevel()
+  if (!query.data) return null
+  return (
+    <div className="flex items-center gap-2">
+      <span className="hidden text-sm text-muted-foreground sm:inline">
+        {t("logs.serverLevel")}
+      </span>
+      <Badge variant="outline" aria-label={`${t("logs.serverLevel")}: ${label(query.data.level)}`}>
+        {label(query.data.level)}
+      </Badge>
+    </div>
   )
 }
 
@@ -393,6 +411,7 @@ function LogViewer({ level }: { level: ViewLevel | undefined }) {
 export default function LogsPage() {
   const { t, fmt } = useI18n()
   const label = useLevelLabel()
+  const { isAdmin } = useSession()
   const [level, setLevel] = React.useState<ViewLevel | undefined>(undefined)
 
   return (
@@ -425,7 +444,7 @@ export default function LogsPage() {
               </SelectContent>
             </Select>
             <Separator orientation="vertical" className="hidden h-6 sm:block" />
-            <ServerLevelSelect />
+            {isAdmin ? <ServerLevelSelect /> : <ServerLevelBadge />}
           </>
         }
       />

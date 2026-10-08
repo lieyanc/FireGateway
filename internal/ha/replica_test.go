@@ -37,7 +37,7 @@ func (w *wire) Call(ctx context.Context, method string, req PeerRequest) (PeerRe
 		return PeerResponse{}, context.DeadlineExceeded
 	}
 	c := w.target
-	out := PeerResponse{Protocol: 1, NodeID: c.node}
+	out := PeerResponse{Protocol: Protocol, NodeID: c.node}
 	var err error
 	switch method {
 	case "heartbeat", "snapshot":
@@ -156,7 +156,7 @@ func TestPairReplicationLostAcknowledgmentAndCrashRecovery(t *testing.T) {
 	r := first.Rules[0]
 	r.TargetPort = 4000
 	p.ab.loseAfter = "commit"
-	if _, err := p.a.mgr.Update("web", r); err == nil {
+	if _, err := p.a.mgr.Update(gateway.Admin, "web", r); err == nil {
 		t.Fatal("lost ACK reported success")
 	} else {
 		var pending *PendingError
@@ -195,7 +195,7 @@ func TestPrepareIsNotCommittedAndFailoverRejectsDelayedMessages(t *testing.T) {
 	r := old.Rules[0]
 	r.TargetPort = 4444
 	p.ab.loseAfter = "prepare"
-	_, err := p.a.mgr.Update("web", r)
+	_, err := p.a.mgr.Update(gateway.Admin, "web", r)
 	if err == nil {
 		t.Fatal("prepare ACK loss accepted")
 	}
@@ -265,7 +265,7 @@ func TestAutomaticFailoverNonpreemptionAndBadPeerCredentials(t *testing.T) {
 	}
 	changed := p.b.replica.state().Committed.Rules[0]
 	changed.TargetPort++
-	if _, err := p.b.mgr.Update("web", changed); !errors.Is(err, config.ErrClusterUnavailable) {
+	if _, err := p.b.mgr.Update(gateway.Admin, "web", changed); !errors.Is(err, config.ErrClusterUnavailable) {
 		t.Fatalf("backup writable without promotion: %v", err)
 	}
 }
@@ -278,7 +278,7 @@ func TestRouterFailureDoesNotBlockRuleReplication(t *testing.T) {
 	}
 	r := p.a.replica.state().Committed.Rules[0]
 	r.TargetPort = 4567
-	if _, err := p.a.mgr.Update("web", r); err != nil {
+	if _, err := p.a.mgr.Update(gateway.Admin, "web", r); err != nil {
 		t.Fatal(err)
 	}
 	if p.b.replica.state().Committed.Rules[0].TargetPort != 4567 {
@@ -300,10 +300,10 @@ func TestPromotionRejoinAndRejectDivergentEpoch(t *testing.T) {
 	}
 	r := old.Rules[0]
 	r.TargetPort = 6789
-	if _, err := p.b.mgr.Update("web", r); err != nil {
+	if _, err := p.b.mgr.Update(gateway.Admin, "web", r); err != nil {
 		t.Fatal(err)
 	}
-	tx := Transaction{ID: nonce(), PairID: p.a.replica.state().PairID, Kind: "rules", Expected: old.Checksum, Next: config.WithWriter(old, 1, "a", old.Rules)}
+	tx := Transaction{ID: nonce(), PairID: p.a.replica.state().PairID, Kind: "rules", Expected: old.Checksum, Next: config.WithWriter(old, 1, "a", old)}
 	if err := p.b.replica.Prepare(tx); err == nil {
 		t.Fatal("old writer accepted after promotion")
 	}
@@ -374,26 +374,26 @@ func TestReplicaIdempotencyAndConflictingPrepare(t *testing.T) {
 	bootstrap(t, p)
 	before := p.a.replica.state().Committed
 	id := "test-request-12345"
-	if _, err := p.a.replica.BeginEdit(id, "request-hash", before.Checksum); err != nil {
+	if _, err := p.a.replica.BeginEdit(id, "request-hash", Expect(before.Checksum)); err != nil {
 		t.Fatal(err)
 	}
 	r := before.Rules[0]
 	r.TargetPort = 4444
-	if _, err := p.a.mgr.Update("web", r); err != nil {
+	if _, err := p.a.mgr.Update(gateway.Admin, "web", r); err != nil {
 		t.Fatal(err)
 	}
 	reply := Reply{Status: 200, Body: json.RawMessage(`{"saved":true}`)}
 	if err := p.a.replica.EndEdit(id, "request-hash", reply); err != nil {
 		t.Fatal(err)
 	}
-	cached, err := p.a.replica.BeginEdit(id, "request-hash", before.Checksum)
+	cached, err := p.a.replica.BeginEdit(id, "request-hash", Expect(before.Checksum))
 	if err != nil || cached == nil || cached.Status != 200 {
 		t.Fatal("retry was not idempotent")
 	}
-	if _, err = p.a.replica.BeginEdit(id, "other-content", before.Checksum); !errors.Is(err, config.ErrRevisionConflict) {
+	if _, err = p.a.replica.BeginEdit(id, "other-content", Expect(before.Checksum)); !errors.Is(err, config.ErrRevisionConflict) {
 		t.Fatal("ID reuse accepted")
 	}
-	tx := Transaction{ID: nonce(), PairID: p.a.replica.state().PairID, Kind: "rules", Expected: before.Checksum, Next: config.WithWriter(before, 1, "a", before.Rules)}
+	tx := Transaction{ID: nonce(), PairID: p.a.replica.state().PairID, Kind: "rules", Expected: before.Checksum, Next: config.WithWriter(before, 1, "a", before)}
 	if err = p.b.replica.Prepare(tx); !errors.Is(err, config.ErrRevisionConflict) {
 		t.Fatalf("stale parent accepted: %v", err)
 	}
@@ -408,7 +408,7 @@ func TestWriterHandoffRecoversLostAcknowledgements(t *testing.T) {
 			if err := p.a.replica.Transfer(context.Background()); err == nil {
 				t.Fatal("lost handoff response reported success")
 			}
-			if _, err := p.a.replica.BeginEdit("interrupted-handoff", "hash", p.a.Status().Checksum); !errors.Is(err, config.ErrClusterUnavailable) {
+			if _, err := p.a.replica.BeginEdit("interrupted-handoff", "hash", Expect(p.a.Status().Checksum)); !errors.Is(err, config.ErrClusterUnavailable) {
 				t.Fatal("old writer remained writable during handoff")
 			}
 			if err := p.a.replica.Recover(context.Background()); err != nil {

@@ -21,6 +21,7 @@ type Rule struct {
 	Remark          string  `json:"remark,omitempty"`
 	ACL             *ACL    `json:"acl,omitempty"`
 	Limits          *Limits `json:"limits,omitempty"`
+	Owner           string  `json:"owner,omitempty"` // tenant id; empty = administrator rule
 }
 
 type ACL struct {
@@ -127,6 +128,11 @@ const maxRangePorts = 1024
 func (r *Rule) Validate() error {
 	if err := ValidateID(r.ID); err != nil {
 		return err
+	}
+	if r.Owner != "" {
+		if err := ValidateID(RuleID(r.Owner)); err != nil {
+			return &FieldError{"owner", "invalid tenant id"}
+		}
 	}
 	if len(r.Name) > 128 {
 		return &FieldError{"name", "name must be at most 128 characters"}

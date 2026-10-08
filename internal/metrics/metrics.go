@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -144,15 +145,19 @@ type Sampler struct {
 
 	mu      sync.RWMutex
 	rules   map[config.RuleID]*ruleState
+	tenants map[string]*series // traffic of each tenant's rules
 	global  *series
 	gRateUp int64
 	gRateDn int64
+
+	// Usage receives each tenant's transferred bytes once per sample.
+	Usage func(map[string]int64)
 }
 
 func New(mgr *gateway.Manager, store *config.Store, broker *events.Broker) *Sampler {
 	s := &Sampler{
 		mgr: mgr, store: store, broker: broker, dataDir: store.Get().DataDir,
-		rules: make(map[config.RuleID]*ruleState), global: newSeries(),
+		rules: make(map[config.RuleID]*ruleState), tenants: make(map[string]*series), global: newSeries(),
 	}
 	if err := s.load(); err != nil && !errors.Is(err, os.ErrNotExist) {
 		slog.Warn("failed to load metrics history", "err", err)
@@ -186,9 +191,10 @@ func (s *Sampler) sample(now time.Time, elapsed float64) {
 	t := now.Unix()
 	runners := s.mgr.Runners()
 	cfg := s.store.Get()
-	ev := statsEvent{T: t, Rules: make(map[config.RuleID]ruleStats, len(cfg.Forward))}
+	ev := StatsEvent{T: t, Rules: make(map[config.RuleID]RuleStats, len(cfg.Forward))}
 	var g Point
 	g.T = t
+	owned := map[string]*Point{}
 
 	s.mu.Lock()
 	for i := range cfg.Forward {
@@ -220,10 +226,41 @@ func (s *Sampler) sample(now time.Time, elapsed float64) {
 		g.Down += p.Down
 		g.Conns += p.Conns
 		g.Active += p.Active
+		if r.Owner != "" {
+			tp := owned[r.Owner]
+			if tp == nil {
+				tp = &Point{T: t}
+				owned[r.Owner] = tp
+			}
+			tp.Up += p.Up
+			tp.Down += p.Down
+			tp.Conns += p.Conns
+			tp.Active += p.Active
+		}
 
 		c := CountersOf(snap, st.rateUp, st.rateDown)
 		ev.Totals.Add(c)
-		ev.Rules[r.ID] = ruleStats{c, s.mgr.State(r)}
+		ev.Rules[r.ID] = RuleStats{c, s.mgr.State(r), r.Owner}
+	}
+	usage := make(map[string]int64, len(owned))
+	for tenant, p := range owned {
+		se := s.tenants[tenant]
+		if se == nil {
+			se = newSeries()
+			s.tenants[tenant] = se
+		}
+		se.record(*p)
+		if p.Up+p.Down > 0 {
+			usage[tenant] = p.Up + p.Down
+		}
+	}
+	// Tenants without rules keep their history until the tenant is deleted.
+	if cfg.Access != nil {
+		for tenant := range s.tenants {
+			if cfg.Access.Tenant(tenant) == nil {
+				delete(s.tenants, tenant)
+			}
+		}
 	}
 	// Forget deleted rules.
 	for id := range s.rules {
@@ -235,18 +272,35 @@ func (s *Sampler) sample(now time.Time, elapsed float64) {
 	s.gRateUp, s.gRateDn = ev.Totals.RateUp, ev.Totals.RateDown
 	s.mu.Unlock()
 
+	if s.Usage != nil && len(usage) > 0 {
+		s.Usage(usage)
+	}
 	s.broker.Publish("stats", ev)
 }
 
-type ruleStats struct {
+type RuleStats struct {
 	Counters
 	State string `json:"state"`
+	Owner string `json:"-"`
 }
 
-type statsEvent struct {
+// StatsEvent is the payload of the per-second "stats" event.
+type StatsEvent struct {
 	T      int64                       `json:"t"`
 	Totals Counters                    `json:"totals"`
-	Rules  map[config.RuleID]ruleStats `json:"rules"`
+	Rules  map[config.RuleID]RuleStats `json:"rules"`
+}
+
+// ForTenant keeps only a tenant's rules and recomputes the totals.
+func (e StatsEvent) ForTenant(tenant string) StatsEvent {
+	out := StatsEvent{T: e.T, Rules: make(map[config.RuleID]RuleStats)}
+	for id, st := range e.Rules {
+		if st.Owner == tenant {
+			out.Rules[id] = st
+			out.Totals.Add(st.Counters)
+		}
+	}
+	return out
 }
 
 func delta(cur, prev int64) int64 {
@@ -273,9 +327,18 @@ func (s *Sampler) Rates(id config.RuleID) (up, down int64) {
 	return 0, 0
 }
 
+// Tenant series are addressed as "tenant:<id>"; rule ids cannot contain ':'.
+const tenantPrefix = "tenant:"
+
+// TenantSeries names the aggregate series of a tenant's rules.
+func TenantSeries(tenant string) config.RuleID { return config.RuleID(tenantPrefix + tenant) }
+
 func (s *Sampler) seriesFor(id config.RuleID) *series {
 	if id == "" {
 		return s.global
+	}
+	if tenant, ok := strings.CutPrefix(string(id), tenantPrefix); ok {
+		return s.tenants[tenant]
 	}
 	if st := s.rules[id]; st != nil {
 		return st.series
@@ -348,14 +411,18 @@ type TopItem struct {
 	Conns  int64  `json:"conns"`
 }
 
-// Top sums each rule's traffic over the range, largest first.
-func (s *Sampler) Top(rng string) ([]TopItem, bool) {
+// Top sums the traffic over the range of each rule keep accepts (all when
+// nil), largest first.
+func (s *Sampler) Top(rng string, keep func(*config.Rule) bool) ([]TopItem, bool) {
 	if _, ok := Ranges[rng]; !ok {
 		return nil, false
 	}
 	cfg := s.store.Get()
 	items := make([]TopItem, 0, len(cfg.Forward))
 	for _, r := range cfg.Forward {
+		if keep != nil && !keep(&r) {
+			continue
+		}
 		_, pts, _ := s.History(r.ID, rng)
 		it := TopItem{RuleID: string(r.ID), Name: r.Name}
 		for _, p := range pts {
@@ -387,6 +454,7 @@ type savedFile struct {
 	Version int
 	Global  savedSeries
 	Rules   map[string]savedSeries
+	Tenants map[string]savedSeries
 }
 
 func (s *Sampler) path() string { return filepath.Join(s.dataDir, "metrics.gob") }
@@ -417,6 +485,10 @@ func (s *Sampler) Save() error {
 	f := savedFile{Version: 1, Global: dump(s.global), Rules: make(map[string]savedSeries, len(s.rules))}
 	for id, st := range s.rules {
 		f.Rules[string(id)] = dump(st.series)
+	}
+	f.Tenants = make(map[string]savedSeries, len(s.tenants))
+	for id, se := range s.tenants {
+		f.Tenants[id] = dump(se)
 	}
 	s.mu.RUnlock()
 
@@ -451,6 +523,9 @@ func (s *Sampler) load() error {
 	s.global = restore(f.Global)
 	for id, sv := range f.Rules {
 		s.rules[config.RuleID(id)] = &ruleState{series: restore(sv)}
+	}
+	for id, sv := range f.Tenants {
+		s.tenants[id] = restore(sv)
 	}
 	return nil
 }

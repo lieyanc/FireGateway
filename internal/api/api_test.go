@@ -25,6 +25,7 @@ type harness struct {
 	ts     *httptest.Server
 	client *http.Client
 	auth   *auth.Service
+	srv    *Server
 }
 
 func newHarness(t *testing.T) *harness {
@@ -49,7 +50,7 @@ func newHarness(t *testing.T) *harness {
 	ts := httptest.NewServer(s.routes())
 	t.Cleanup(ts.Close)
 	jar, _ := cookiejar.New(nil)
-	return &harness{ts: ts, client: &http.Client{Jar: jar}, auth: a}
+	return &harness{ts: ts, client: &http.Client{Jar: jar}, auth: a, srv: s}
 }
 
 func (h *harness) do(t *testing.T, method, path, body string, hdr ...string) (int, map[string]any) {
@@ -68,6 +69,17 @@ func (h *harness) do(t *testing.T, method, path, body string, hdr ...string) (in
 	var out map[string]any
 	json.Unmarshal(data, &out)
 	return resp.StatusCode, out
+}
+
+// ruleVersion returns the caller's current rule version for If-Match.
+func (h *harness) ruleVersion(t *testing.T) string {
+	t.Helper()
+	resp, err := h.client.Get(h.ts.URL + "/api/rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return strings.Trim(resp.Header.Get("ETag"), `"`)
 }
 
 func (h *harness) setup(t *testing.T) {

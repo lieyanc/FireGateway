@@ -31,7 +31,7 @@ func TestPreparedGateAndLocalServiceForwarding(t *testing.T) {
 	rule := tcpRule(freePort(t))
 	rule.ID = "web"
 	rule.TargetHost = "192.0.2.99"
-	if _, err := m.Create(rule); err != nil {
+	if _, err := m.Create(Admin, rule); err != nil {
 		t.Fatal(err)
 	}
 	local, port := "127.0.0.1", upstream.Addr().(*net.TCPAddr).Port

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"net/http"
@@ -51,18 +52,39 @@ func (s *Server) view(r config.Rule) ruleView {
 	return v
 }
 
-func (s *Server) listRules(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("ETag", `"`+s.Store.Rules().Snapshot().Checksum+`"`)
-	rules := s.Manager.List()
+// visibleRules returns the rules the caller may see.
+func (s *Server) visibleRules(r *http.Request) []config.Rule {
+	scope := scopeOf(r)
+	out := []config.Rule{}
+	for _, rule := range s.Manager.List() {
+		if scope.Owns(&rule) {
+			out = append(out, rule)
+		}
+	}
+	return out
+}
+
+// visibleRule returns a rule the caller may see.
+func (s *Server) visibleRule(r *http.Request, id config.RuleID) (config.Rule, bool) {
+	rule, ok := s.Manager.Get(id)
+	if !ok || !scopeOf(r).Owns(&rule) {
+		return config.Rule{}, false
+	}
+	return rule, true
+}
+
+func (s *Server) listRules(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("ETag", `"`+ruleVersion(scopeOf(r), s.Store.Rules().Snapshot())+`"`)
+	rules := s.visibleRules(r)
 	items := make([]ruleView, len(rules))
-	for i, r := range rules {
-		items[i] = s.view(r)
+	for i, rule := range rules {
+		items[i] = s.view(rule)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 func (s *Server) getRule(w http.ResponseWriter, r *http.Request) {
-	rule, ok := s.Manager.Get(config.RuleID(r.PathValue("id")))
+	rule, ok := s.visibleRule(r, config.RuleID(r.PathValue("id")))
 	if !ok {
 		failErr(w, gateway.ErrNotFound)
 		return
@@ -75,7 +97,7 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &rule, ruleBodyLimit) {
 		return
 	}
-	created, err := s.Manager.Create(rule)
+	created, err := s.Manager.Create(scopeOf(r), rule)
 	if err != nil {
 		failErr(w, err)
 		return
@@ -84,11 +106,26 @@ func (s *Server) createRule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) updateRule(w http.ResponseWriter, r *http.Request) {
-	var rule config.Rule
-	if !decode(w, r, &rule, ruleBodyLimit) {
+	var raw json.RawMessage
+	if !decode(w, r, &raw, ruleBodyLimit) {
 		return
 	}
-	updated, err := s.Manager.Update(config.RuleID(r.PathValue("id")), rule)
+	var rule config.Rule
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &rule); err != nil {
+		fail(w, http.StatusBadRequest, "bad_request", "invalid JSON: "+err.Error())
+		return
+	}
+	id := config.RuleID(r.PathValue("id"))
+	// Clients unaware of tenants omit the owner; keep the current one.
+	if json.Unmarshal(raw, &fields) == nil {
+		if _, ok := fields["owner"]; !ok {
+			if old, ok := s.Manager.Get(id); ok {
+				rule.Owner = old.Owner
+			}
+		}
+	}
+	updated, err := s.Manager.Update(scopeOf(r), id, rule)
 	if err != nil {
 		failErr(w, err)
 		return
@@ -97,7 +134,7 @@ func (s *Server) updateRule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteRule(w http.ResponseWriter, r *http.Request) {
-	if err := s.Manager.Delete(config.RuleID(r.PathValue("id"))); err != nil {
+	if err := s.Manager.Delete(scopeOf(r), config.RuleID(r.PathValue("id"))); err != nil {
 		failErr(w, err)
 		return
 	}
@@ -108,7 +145,7 @@ func (s *Server) enableRule(w http.ResponseWriter, r *http.Request)  { s.setActi
 func (s *Server) disableRule(w http.ResponseWriter, r *http.Request) { s.setActive(w, r, false) }
 
 func (s *Server) setActive(w http.ResponseWriter, r *http.Request, active bool) {
-	rule, err := s.Manager.SetActive(config.RuleID(r.PathValue("id")), active)
+	rule, err := s.Manager.SetActive(scopeOf(r), config.RuleID(r.PathValue("id")), active)
 	if err != nil {
 		failErr(w, err)
 		return
@@ -117,7 +154,7 @@ func (s *Server) setActive(w http.ResponseWriter, r *http.Request, active bool) 
 }
 
 func (s *Server) restartRule(w http.ResponseWriter, r *http.Request) {
-	rule, err := s.Manager.Restart(config.RuleID(r.PathValue("id")))
+	rule, err := s.Manager.Restart(scopeOf(r), config.RuleID(r.PathValue("id")))
 	if err != nil {
 		failErr(w, err)
 		return
@@ -133,7 +170,7 @@ func (s *Server) batchRules(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &b, 1<<20) {
 		return
 	}
-	res, err := s.Manager.Batch(b.Action, b.IDs)
+	res, err := s.Manager.Batch(scopeOf(r), b.Action, b.IDs)
 	if err != nil {
 		failErr(w, err)
 		return
@@ -141,10 +178,10 @@ func (s *Server) batchRules(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-func (s *Server) exportRules(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) exportRules(w http.ResponseWriter, r *http.Request) {
 	name := "firegateway-rules-" + time.Now().Format("20060102-150405") + ".json"
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
-	writeJSON(w, http.StatusOK, map[string]any{"forward": s.Manager.List()})
+	writeJSON(w, http.StatusOK, map[string]any{"forward": s.visibleRules(r)})
 }
 
 func (s *Server) importRules(w http.ResponseWriter, r *http.Request) {
@@ -163,7 +200,7 @@ func (s *Server) importRules(w http.ResponseWriter, r *http.Request) {
 		failErr(w, &config.FieldError{Field: "forward", Msg: "forward array is required"})
 		return
 	}
-	res, err := s.Manager.Import(b.Forward, b.Mode == "replace")
+	res, err := s.Manager.Import(scopeOf(r), b.Forward, b.Mode == "replace")
 	if err != nil {
 		failErr(w, err)
 		return
@@ -262,9 +299,9 @@ type connView struct {
 }
 
 func (s *Server) listConns(w http.ResponseWriter, r *http.Request) {
-	conns := s.Manager.Connections(config.RuleID(r.URL.Query().Get("rule")))
+	conns := s.Manager.Connections(scopeOf(r), config.RuleID(r.URL.Query().Get("rule")))
 	names := make(map[config.RuleID]string)
-	for _, rule := range s.Manager.List() {
+	for _, rule := range s.visibleRules(r) {
 		names[rule.ID] = rule.Name
 	}
 	items := make([]connView, len(conns))
@@ -281,7 +318,7 @@ func (s *Server) listConns(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) closeConn(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.ParseUint(r.PathValue("id"), 10, 64)
-	if err != nil || !s.Manager.CloseConn(id) {
+	if err != nil || !s.Manager.CloseConn(scopeOf(r), id) {
 		fail(w, http.StatusNotFound, "not_found", "connection not found")
 		return
 	}
@@ -294,7 +331,7 @@ func (s *Server) closeRuleConns(w http.ResponseWriter, r *http.Request) {
 		failErr(w, &config.FieldError{Field: "rule", Msg: "rule query parameter is required"})
 		return
 	}
-	n, err := s.Manager.CloseRuleConns(rule)
+	n, err := s.Manager.CloseRuleConns(scopeOf(r), rule)
 	if err != nil {
 		failErr(w, err)
 		return
@@ -304,14 +341,39 @@ func (s *Server) closeRuleConns(w http.ResponseWriter, r *http.Request) {
 
 // Metrics.
 
+// metricsSeries picks the series a metrics query reads: a visible rule, or
+// the caller's total (the tenant's rules for members).
+func (s *Server) metricsSeries(w http.ResponseWriter, r *http.Request) (config.RuleID, bool) {
+	id := config.RuleID(r.URL.Query().Get("rule"))
+	scope := scopeOf(r)
+	switch {
+	case scope == gateway.Admin:
+		return id, true
+	case id == "":
+		return metrics.TenantSeries(scope.Tenant), true
+	}
+	if _, ok := s.visibleRule(r, id); !ok {
+		failErr(w, gateway.ErrNotFound)
+		return "", false
+	}
+	return id, true
+}
+
 func (s *Server) metricsRealtime(w http.ResponseWriter, r *http.Request) {
-	pts := s.Sampler.Realtime(config.RuleID(r.URL.Query().Get("rule")))
+	id, ok := s.metricsSeries(w, r)
+	if !ok {
+		return
+	}
+	pts := s.Sampler.Realtime(id)
 	writeJSON(w, http.StatusOK, map[string]any{"step": 1, "points": pts})
 }
 
 func (s *Server) metricsHistory(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	step, pts, ok := s.Sampler.History(config.RuleID(q.Get("rule")), q.Get("range"))
+	id, ok := s.metricsSeries(w, r)
+	if !ok {
+		return
+	}
+	step, pts, ok := s.Sampler.History(id, r.URL.Query().Get("range"))
 	if !ok {
 		failErr(w, &config.FieldError{Field: "range", Msg: "range must be 1h, 24h, 7d or 30d"})
 		return
@@ -320,7 +382,7 @@ func (s *Server) metricsHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) metricsTop(w http.ResponseWriter, r *http.Request) {
-	items, ok := s.Sampler.Top(r.URL.Query().Get("range"))
+	items, ok := s.Sampler.Top(r.URL.Query().Get("range"), scopeOf(r).Owns)
 	if !ok {
 		failErr(w, &config.FieldError{Field: "range", Msg: "range must be 1h, 24h, 7d or 30d"})
 		return

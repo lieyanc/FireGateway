@@ -7,9 +7,12 @@ export type ApiErrorCode =
   | "forbidden"
   | "not_found"
   | "conflict"
+  | "quota_exceeded"
   | "rate_limited"
   | "not_initialized"
   | "already_initialized"
+  | "unavailable"
+  | "sync_pending"
   | "internal"
   | "not_supported"
 
@@ -21,17 +24,75 @@ export type ApiErrorBody = {
 
 // ---- Auth ----
 
+export type Role = "admin" | "member"
+
 export type AuthState = {
   initialized: boolean
+  /** First start, or account recovery enabled with -reset-auth. */
+  setupAvailable?: boolean
   authenticated: boolean
+  userId?: string
   username?: string
+  role?: Role
+  tenantId?: string
+  tenantName?: string
 }
+
+export type Account = { id: string; username: string }
 
 export type ApiToken = {
   id: string
   name: string
   prefix: string
   createdAt: string
+}
+
+// ---- Users and tenants ----
+
+export type User = {
+  id: string
+  username: string
+  role: Role
+  tenantId?: string
+  disabled: boolean
+  tokens: number
+  createdAt: string
+}
+
+export type UserInput = {
+  username?: string
+  password?: string
+  role?: Role
+  tenantId?: string
+  disabled?: boolean
+}
+
+/** Inclusive [from, to] span of local ports. */
+export type PortRange = [number, number]
+
+export type TenantQuota = {
+  /** 0 or absent = unlimited. */
+  maxRules?: number
+  /** Up+down bytes per period across both nodes; 0 or absent = unlimited. */
+  monthlyBytes?: number
+  /** 1-28, day of month (UTC) a period starts; absent = 1. */
+  resetDay?: number
+}
+
+export type TenantInput = {
+  id: string
+  name: string
+  portRanges: PortRange[]
+  quota: TenantQuota
+}
+
+export type Tenant = TenantInput & {
+  usageResetAt?: string
+  createdAt: string
+  rules: number
+  users: number
+  usage: { since: string; bytes: number }
+  suspended: boolean
 }
 
 // ---- Rules ----
@@ -63,11 +124,13 @@ export type Rule = {
   localPortRange?: [number, number]
   targetPortRange?: [number, number]
   remark?: string
+  /** Owning tenant id; empty = administrators only. */
+  owner?: string
   acl?: RuleAcl
   limits?: RuleLimits
 }
 
-export type RuleState = "running" | "partial" | "error" | "stopped"
+export type RuleState = "running" | "partial" | "error" | "stopped" | "suspended"
 
 export type Counters = {
   activeConnections: number
@@ -85,6 +148,7 @@ export type RuleFailure = { port: number; error: string }
 
 export type RuleRuntime = Counters & {
   state: RuleState
+  error?: string
   listeners: number
   failures?: RuleFailure[]
   startedAt?: string
@@ -221,27 +285,29 @@ export type VersionInfo = {
   updateSource: string
 }
 
+/** Host fields are only sent to administrators. */
 export type Overview = {
   version: string
   commit: string
   buildTime: string
   startedAt: string
   uptime: number
-  goVersion: string
-  os: string
-  arch: string
-  cpus: number
-  goroutines: number
-  memory: { sys: number; heapAlloc: number; heapInuse: number }
+  goVersion?: string
+  os?: string
+  arch?: string
+  cpus?: number
+  goroutines?: number
+  memory?: { sys: number; heapAlloc: number; heapInuse: number }
   rules: {
     total: number
     active: number
     running: number
     partial: number
     error: number
+    suspended?: number
   }
   totals: Counters
-  configPath: string
+  configPath?: string
 }
 
 // ---- Settings ----

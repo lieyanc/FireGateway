@@ -173,6 +173,11 @@ export const rules = defineMessages({
       targetEndAuto: "The end port fills in automatically.",
       remark: "Remark",
       remarkPlaceholder: "Optional note",
+      owner: "Tenant",
+      ownerNone: "None (administrators only)",
+      ownerHint: "Members of the tenant can view and manage this rule; its traffic counts toward the tenant's quota.",
+      allowedPorts: "Ports available to your tenant: {ranges}",
+      noPorts: "Your tenant has no ports assigned. Ask an administrator.",
       acl: {
         mode: "Source filter",
         none: "Off",
@@ -260,6 +265,7 @@ export const rules = defineMessages({
         bandwidth: "Bandwidth",
         perDirection: "{rate} per direction",
         remark: "Remark",
+        owner: "Tenant",
       },
       connections: {
         title: "Live connections",
@@ -433,6 +439,11 @@ export const rules = defineMessages({
       targetEndAuto: "结束端口会自动填写。",
       remark: "备注",
       remarkPlaceholder: "可选",
+      owner: "所属租户",
+      ownerNone: "无（仅管理员可见）",
+      ownerHint: "该租户成员可以查看和管理此规则，其流量计入租户配额。",
+      allowedPorts: "所在租户可用端口：{ranges}",
+      noPorts: "所在租户尚未分配端口，请联系管理员。",
       acl: {
         mode: "来源过滤",
         none: "关闭",
@@ -520,6 +531,7 @@ export const rules = defineMessages({
         bandwidth: "带宽",
         perDirection: "每个方向 {rate}",
         remark: "备注",
+        owner: "所属租户",
       },
       connections: {
         title: "当前连接",

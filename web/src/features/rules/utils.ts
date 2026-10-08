@@ -47,13 +47,20 @@ export function matchesSearch(rule: Rule, query: string) {
   return false
 }
 
-export const RULE_STATES: RuleState[] = ["running", "partial", "error", "stopped"]
+export const RULE_STATES: RuleState[] = [
+  "running",
+  "partial",
+  "error",
+  "suspended",
+  "stopped",
+]
 
 export const STATE_ORDER: Record<RuleState, number> = {
   error: 0,
   partial: 1,
-  running: 2,
-  stopped: 3,
+  suspended: 2,
+  running: 3,
+  stopped: 4,
 }
 
 /** Strips the runtime part of a view, e.g. before duplicating or exporting. */

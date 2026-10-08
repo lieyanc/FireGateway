@@ -6,6 +6,7 @@ import {
   ArrowLeftRightIcon,
   ArrowUpIcon,
   ChevronRightIcon,
+  CirclePauseIcon,
   GaugeIcon,
   HardDriveIcon,
   ShieldAlertIcon,
@@ -15,6 +16,7 @@ import {
 import { LiveThroughputChart } from "@/components/charts/live-throughput-chart"
 import { PageContainer, PageHeader } from "@/components/common/page-header"
 import { QueryError } from "@/components/common/query-state"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -31,6 +33,7 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
+import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
   Table,
@@ -42,9 +45,11 @@ import {
 } from "@/components/ui/table"
 import { useNow } from "@/hooks/use-now"
 import { useI18n } from "@/i18n"
-import { useOverview, useRules } from "@/lib/queries"
+import { useOverview, useOwnTenant, useRules, useSession } from "@/lib/queries"
 import { useStats } from "@/lib/stats-store"
-import type { Counters, Overview, StatsEvent } from "@/lib/types"
+import type { Counters, Overview, StatsEvent, Tenant } from "@/lib/types"
+import { cn } from "@/lib/utils"
+import { formatPortRanges } from "@/features/access/utils"
 
 /** Live totals when streaming, otherwise the last overview snapshot. */
 function useTotals<T>(
@@ -96,16 +101,18 @@ type StateCounts = {
   running: number
   partial: number
   error: number
+  suspended: number
 }
 
 function countStates(event: StatsEvent | null): StateCounts | undefined {
   if (!event) return undefined
-  const counts = { total: 0, running: 0, partial: 0, error: 0 }
+  const counts = { total: 0, running: 0, partial: 0, error: 0, suspended: 0 }
   for (const r of Object.values(event.rules)) {
     counts.total++
     if (r.state === "running") counts.running++
     else if (r.state === "partial") counts.partial++
     else if (r.state === "error") counts.error++
+    else if (r.state === "suspended") counts.suspended++
   }
   return counts
 }
@@ -114,8 +121,11 @@ function RulesCard({ overview }: { overview: Overview | undefined }) {
   const { t } = useI18n()
   const live = useStats(countStates)
   const counts: StateCounts | undefined =
-    live && live.total > 0 ? live : overview?.rules
-  const healthy = counts && counts.partial === 0 && counts.error === 0
+    live && live.total > 0
+      ? live
+      : overview && { ...overview.rules, suspended: overview.rules.suspended ?? 0 }
+  const healthy =
+    counts && counts.partial === 0 && counts.error === 0 && counts.suspended === 0
 
   return (
     <StatCard
@@ -146,6 +156,11 @@ function RulesCard({ overview }: { overview: Overview | undefined }) {
             {counts.error > 0 && (
               <Badge variant="destructive">
                 {t("dashboard.cards.error", { count: counts.error })}
+              </Badge>
+            )}
+            {counts.suspended > 0 && (
+              <Badge variant="warning">
+                {t("dashboard.cards.suspended", { count: counts.suspended })}
               </Badge>
             )}
           </>
@@ -342,11 +357,21 @@ function TopRulesCard() {
   )
 }
 
+type HostOverview = Overview &
+  Required<
+    Pick<Overview, "memory" | "goroutines" | "os" | "arch" | "cpus" | "goVersion">
+  >
+
+/** Host details are only sent to administrators. */
+function hasHost(overview: Overview): overview is HostOverview {
+  return overview.memory !== undefined
+}
+
 function SystemCard({
   overview,
   updatedAt,
 }: {
-  overview: Overview
+  overview: HostOverview
   updatedAt: number
 }) {
   const { t, fmt } = useI18n()
@@ -403,8 +428,118 @@ function SystemCard({
   )
 }
 
+function QuotaMeter({ used, limit }: { used: number; limit: number }) {
+  const ratio = used / limit
+  return (
+    <Progress
+      value={Math.min(100, ratio * 100)}
+      className={cn(
+        ratio >= 1
+          ? "*:data-[slot=progress-indicator]:bg-destructive"
+          : ratio >= 0.9 && "*:data-[slot=progress-indicator]:bg-warning"
+      )}
+    />
+  )
+}
+
+function TenantCard({ tenant }: { tenant: Tenant }) {
+  const { t, fmt } = useI18n()
+  const maxRules = tenant.quota.maxRules ?? 0
+  const maxBytes = tenant.quota.monthlyBytes ?? 0
+
+  const items: [string, React.ReactNode][] = [
+    [
+      t("dashboard.tenant.name"),
+      <span className="flex min-w-0 flex-col">
+        <span className="truncate font-medium">{tenant.name || tenant.id}</span>
+        {tenant.name && (
+          <span className="truncate font-mono text-xs text-muted-foreground">
+            {tenant.id}
+          </span>
+        )}
+      </span>,
+    ],
+    [
+      t("dashboard.tenant.ports"),
+      tenant.portRanges.length > 0 ? (
+        <span className="font-mono break-words">{formatPortRanges(tenant.portRanges)}</span>
+      ) : (
+        <span className="text-muted-foreground">{t("dashboard.tenant.noPorts")}</span>
+      ),
+    ],
+    [
+      t("dashboard.tenant.rules"),
+      <span className="flex flex-col gap-1 tabular-nums">
+        {maxRules > 0
+          ? t("dashboard.tenant.ofLimit", {
+              used: fmt.number(tenant.rules),
+              limit: fmt.number(maxRules),
+            })
+          : t("dashboard.tenant.noLimit", { used: fmt.number(tenant.rules) })}
+        {maxRules > 0 && <QuotaMeter used={tenant.rules} limit={maxRules} />}
+      </span>,
+    ],
+    [
+      t("dashboard.tenant.traffic"),
+      <span className="flex flex-col gap-1 tabular-nums">
+        {maxBytes > 0
+          ? t("dashboard.tenant.ofLimit", {
+              used: fmt.bytes(tenant.usage.bytes),
+              limit: fmt.bytes(maxBytes),
+            })
+          : t("dashboard.tenant.noLimit", { used: fmt.bytes(tenant.usage.bytes) })}
+        {maxBytes > 0 && <QuotaMeter used={tenant.usage.bytes} limit={maxBytes} />}
+        <span className="text-xs text-muted-foreground">
+          {t("dashboard.tenant.since", { date: fmt.dateTime(tenant.usage.since) })}
+        </span>
+      </span>,
+    ],
+  ]
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{t("dashboard.tenant.title")}</CardTitle>
+        <CardDescription>{t("dashboard.tenant.description")}</CardDescription>
+        {tenant.suspended && (
+          <CardAction>
+            <Badge variant="destructive">{t("dashboard.tenant.suspended")}</Badge>
+          </CardAction>
+        )}
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        {tenant.suspended && (
+          <Alert variant="destructive">
+            <CirclePauseIcon />
+            <AlertTitle>{t("dashboard.tenant.suspendedTitle")}</AlertTitle>
+            <AlertDescription>{t("dashboard.tenant.suspendedHint")}</AlertDescription>
+          </Alert>
+        )}
+        <dl className="grid gap-x-6 gap-y-4 sm:grid-cols-2 lg:grid-cols-4">
+          {items.map(([label, value]) => (
+            <div key={label} className="flex min-w-0 flex-col gap-1">
+              <dt className="text-xs text-muted-foreground">{label}</dt>
+              <dd className="min-w-0 text-sm">{value}</dd>
+            </div>
+          ))}
+        </dl>
+      </CardContent>
+    </Card>
+  )
+}
+
+function OwnTenantSection() {
+  const tenant = useOwnTenant()
+  if (tenant.data) return <TenantCard tenant={tenant.data} />
+  if (tenant.isError) {
+    return <QueryError error={tenant.error} onRetry={() => void tenant.refetch()} />
+  }
+  return <Skeleton className="h-40" />
+}
+
 export default function DashboardPage() {
   const { t } = useI18n()
+  const { isAdmin, isMember } = useSession()
   const overview = useOverview()
   const data = overview.data
 
@@ -440,8 +575,10 @@ export default function DashboardPage() {
         <TopRulesCard />
       </div>
 
-      {data ? (
-        <SystemCard overview={data} updatedAt={overview.dataUpdatedAt} />
+      {isMember ? (
+        <OwnTenantSection />
+      ) : isAdmin && data ? (
+        hasHost(data) && <SystemCard overview={data} updatedAt={overview.dataUpdatedAt} />
       ) : (
         !overview.isError && <Skeleton className="h-40" />
       )}

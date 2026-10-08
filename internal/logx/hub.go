@@ -51,8 +51,9 @@ func (h *Hub) add(e Entry) {
 }
 
 // Query returns up to limit entries at or above minLevel whose message or
-// attributes contain q (case-insensitive), oldest first.
-func (h *Hub) Query(limit int, minLevel slog.Level, q string) []Entry {
+// attributes contain q (case-insensitive) and that keep accepts (all when
+// nil), oldest first.
+func (h *Hub) Query(limit int, minLevel slog.Level, q string, keep func(*Entry) bool) []Entry {
 	q = strings.ToLower(q)
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -64,7 +65,7 @@ func (h *Hub) Query(limit int, minLevel slog.Level, q string) []Entry {
 	// Walk newest to oldest so the limit keeps the most recent entries.
 	for i := 0; i < n && len(out) < limit; i++ {
 		e := h.buf[(h.next-1-i+len(h.buf))%len(h.buf)]
-		if e.level < minLevel || (q != "" && !e.matches(q)) {
+		if e.level < minLevel || (q != "" && !e.matches(q)) || (keep != nil && !keep(&e)) {
 			continue
 		}
 		out = append(out, e)

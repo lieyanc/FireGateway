@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query"
 import {
   CheckIcon,
   KeyRoundIcon,
+  KeySquareIcon,
   LanguagesIcon,
   LogOutIcon,
   MonitorIcon,
@@ -46,7 +47,7 @@ import { LANG_LABELS, LANGS, useI18n, type Lang, type MessageKey } from "@/i18n"
 import { api } from "@/lib/api"
 import { toastError } from "@/lib/errors"
 import { useLiveStatus } from "@/lib/events"
-import { useAuthState, useRule } from "@/lib/queries"
+import { useAuthState, useRule, useSession } from "@/lib/queries"
 import { signedOut } from "@/lib/session"
 
 export type RouteHandle = {
@@ -238,6 +239,7 @@ function ThemeToggle() {
 function UserMenu() {
   const { t } = useI18n()
   const auth = useAuthState()
+  const { isAdmin, tenantId, tenantName } = useSession()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const username = auth.data?.username ?? ""
@@ -269,6 +271,13 @@ function UserMenu() {
             {t("shell.user.signedInAs")}
           </span>
           <span className="truncate">{username}</span>
+          {auth.data?.role && (
+            <span className="truncate text-xs font-normal text-muted-foreground">
+              {isAdmin
+                ? t("shell.user.admin")
+                : t("shell.user.member", { tenant: tenantName || tenantId || "–" })}
+            </span>
+          )}
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
         <DropdownMenuGroup>
@@ -276,6 +285,12 @@ function UserMenu() {
             <Link to="/settings/account">
               <KeyRoundIcon />
               {t("shell.user.changePassword")}
+            </Link>
+          </DropdownMenuItem>
+          <DropdownMenuItem asChild>
+            <Link to="/settings/tokens">
+              <KeySquareIcon />
+              {t("shell.user.apiTokens")}
             </Link>
           </DropdownMenuItem>
         </DropdownMenuGroup>

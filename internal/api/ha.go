@@ -37,7 +37,7 @@ func (s *Server) ready(w http.ResponseWriter, _ *http.Request) {
 	for _, rule := range s.Manager.List() {
 		if rule.Active() {
 			active++
-			if s.Manager.State(&rule) != gateway.StateRunning {
+			if st := s.Manager.State(&rule); st != gateway.StateRunning && st != gateway.StateSuspended {
 				ready = false
 			}
 		}

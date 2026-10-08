@@ -2,7 +2,7 @@
 
 ## Peer replication and router failover
 
-These management endpoints require ordinary user authentication. Node replication uses a separate credential and never copies user or router credentials.
+These management endpoints require an administrator. Node replication uses a separate credential. The shared state carries user accounts, tenants and API token hashes, so both nodes authenticate the same users. Replication never copies the peer token or the router credentials.
 
 - `GET /api/cluster`: traffic `role` (`standalone`, `active`, `standby`, `disconnected`), `owner`, `address`, `configRole` (`writer`, `replica`, `read_only`), `writer`, `paired`, `epoch`, `desiredRevision`, `checksum`, `appliedRevision`, `localPreparedChecksum`, `peerState`, `peerEpoch`, `peerRevision`, `peerChecksum`, `peerPreparedChecksum`, `replicationState`, `pendingUpdateId?`, `upstreamState`, `takenOver`, `error?`, `syncError?`, `lastSync?`. `lastSync` records successful peer contact; readiness and durable replication are separate. Compare checksums, not revision numbers alone across writer epochs.
 - `GET /api/cluster/config`: saved node-local connection settings `{nodeId, cluster, peerTokenConfigured, routerPasswordConfigured, restartRequired, identityLocked}`. `cluster` is null in standalone mode; otherwise it contains the fields in the deployment guide. `peerToken` and router `password` are always returned as empty strings. Responses are not cacheable.
@@ -19,11 +19,17 @@ These management endpoints require ordinary user authentication. Node replicatio
 - `GET /api/node`: `{node: {id, ruleOverrides}, addresses, effectiveRules, rulesFile}`. `PUT /api/node` updates local overrides only, keyed by rule ID with optional `localHost`, `targetHost`, `localPort`, `targetPort`. Unspecified fields inherit shared values. Node identity is immutable while running; single-port overrides do not apply to ranges. OpenWrt mode requires matching ingress ports across nodes.
 - `GET /ready`: public, 200 only while forwarding is allowed and all active rules are listening; otherwise 503. Does not probe target application health.
 
-Cluster shared-rule mutations require `If-Match: "<checksum>"` (from the `GET /api/rules` ETag) and a stable `Idempotency-Key` of 8–128 characters. The web UI sends them automatically. Standby requests are authenticated locally and forwarded to the unique configuration writer. Stale versions or reused IDs with different content return 409. Known disconnected pairs are read-only; confirmed promotion allows local-only writes.
+In a cluster, writes to shared state run on the configuration writer. Shared state covers rules, accounts, API tokens, users and tenants.
+
+- Rule mutations require `If-Match` with the ETag from `GET /api/rules`. The ETag is a version of the rules the caller can see, plus the caller's tenant record. Changes to another tenant's rules therefore do not invalidate it, and it reveals nothing about them.
+- Rule mutations also need a stable `Idempotency-Key` of 8–128 characters.
+- Account, token, user and tenant writes take no precondition. When their `Idempotency-Key` is missing, the server generates one.
+
+The web UI sends these headers automatically. Standby requests are authenticated locally and forwarded to the unique configuration writer. Stale versions or reused IDs with different content return 409. Known disconnected pairs are read-only; confirmed promotion allows local-only writes.
 
 Ordinary successful writes have durably committed on both nodes. `X-Rule-Durability` is `replicated` or `local_only`; it does not mean listeners are ready. A lost commit confirmation returns 503 with `error: "sync_pending"` and an update identifier; the write may already exist on the peer. Query/retry with the same request ID and original precondition. Never blindly resubmit using a fresh ID after an uncertain result. An outcome persisted before an HTTP receipt could be saved is reported as already committed; refresh rather than executing it again.
 
-`POST /internal/ha/v1` is the protocol-1 node endpoint (`heartbeat`, `snapshot`, `prepare`, `commit`, `handoff-prepare`, `handoff-commit`, `resume`, `mutate`). It accepts only the configured peer bearer token, node identity, cluster identity, receiver identity and matching pair topology. User cookies/API tokens do not authenticate this endpoint. Mutations carry pair identity, writer epoch, parent checksum and transaction identity; arbitrary newer snapshots are not installed.
+`POST /internal/ha/v1` is the protocol-2 node endpoint (`heartbeat`, `snapshot`, `prepare`, `commit`, `handoff-prepare`, `handoff-commit`, `resume`, `mutate`). It accepts only the configured peer bearer token, node identity, cluster identity, receiver identity and matching pair topology. User cookies/API tokens do not authenticate this endpoint. Mutations carry pair identity, writer epoch, parent checksum, transaction identity, and the acting user's ID. The writer re-checks that user's current role and tenant before executing. Arbitrary newer snapshots are not installed.
 
 Legacy `forward` imports/exports remain supported. `rulesFile` is independent of local settings; clustered state is recovered from the adjacent `.ha.json` atomic checkpoint. On first cluster activation, startup adopts existing standalone schema-1 rules into the configured cluster if no HA checkpoint exists. Existing cluster identities cannot be relabelled. See [deployment and recovery](ha-openwrt.md).
 
@@ -33,35 +39,121 @@ Conventions:
 
 - JSON in and out, `camelCase` keys. Timestamps are RFC 3339 strings unless noted (`t` fields in metric points are unix seconds).
 - Byte counters are integers in bytes; rates are bytes per second.
-- Errors: non-2xx status with `{"error": "<code>", "message": "<human readable>", "field"?: "<field path>"}`. Codes used: `bad_request`, `validation`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `rate_limited`, `not_initialized`, `already_initialized`, `internal`, `not_supported`.
+- Errors: non-2xx status with `{"error": "<code>", "message": "<human readable>", "field"?: "<field path>"}`. Codes used: `bad_request`, `validation`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `quota_exceeded`, `rate_limited`, `not_initialized`, `already_initialized`, `unavailable`, `sync_pending`, `internal`, `not_supported`.
 
 ## Authentication
 
-Single admin account. Two ways to authenticate:
+Accounts belong to one of two roles:
+
+- **Administrators** (`admin`) see and manage everything: all rules, users, tenants, cluster, node, settings, DNS and updates.
+- **Members** (`member`) belong to exactly one tenant. All members of a tenant have the same rights. A member sees and manages only the tenant's rules, together with their connections, metrics, events and log records. Every other endpoint returns `403 forbidden`.
+
+Two ways to authenticate:
 
 1. **Session cookie** `fg_session` (HttpOnly, SameSite=Lax), set by `login`/`setup`. For cookie-authenticated `POST/PUT/PATCH/DELETE` requests, a present `Origin` header must match the request host (CSRF defense). Browsers send it automatically; the UI must use same-origin `fetch` with `credentials: "same-origin"`.
-2. **API token** `Authorization: Bearer fgw_...` created in the UI. Tokens have full admin rights.
+2. **API token** `Authorization: Bearer fgw_...` created in the UI. A token acts as the user who created it, with that user's current role and tenant. Disabling or deleting the user disables the token as well.
 
-When no admin exists yet (`initialized=false`), a one-time **setup token** is printed to the server log on startup; `POST /api/auth/setup` requires it.
+When no administrator exists yet (`initialized=false`), the server log prints a one-time **setup token** on startup, and `POST /api/auth/setup` requires it.
 
-Public endpoints (no auth): `GET /health`, `GET /api/version`, `GET /api/auth/state`, `POST /api/auth/login`, `POST /api/auth/setup`. Everything else under `/api` returns `401 unauthorized` without valid credentials.
+**Account recovery.** Run `firegateway -reset-auth` on a stopped node. It changes nothing else, and its next start prints a recovery setup token. Setup with that token does one of two things:
+
+- If an account with that username exists, it resets the password and makes the account an enabled administrator.
+- Otherwise it creates a new administrator.
+
+Either way, every session of that account is signed out. Recovery ends after one successful setup. In a cluster, the reset is a normal replicated write, so it applies on both nodes.
+
+Public endpoints (no auth): `GET /health`, `GET /ready`, `GET /api/version`, `GET /api/auth/state`, `POST /api/auth/login`, `POST /api/auth/setup`. Everything else under `/api` returns `401 unauthorized` without valid credentials.
 
 | Method & path | Body | Response |
 |---|---|---|
-| `GET /api/auth/state` | – | `{initialized: bool, authenticated: bool, username?: string}` |
-| `POST /api/auth/setup` | `{setupToken, username, password}` | `200 {username}` + cookie. `409 already_initialized`, `403 forbidden` (bad token) |
-| `POST /api/auth/login` | `{username, password}` | `200 {username}` + cookie. `401`, `429 rate_limited` (after repeated failures; `Retry-After` header) |
+| `GET /api/auth/state` | – | `AuthState` |
+| `POST /api/auth/setup` | `{setupToken, username, password}` | `200 {id, username}` + cookie. `409 already_initialized`, `403 forbidden` (bad token) |
+| `POST /api/auth/login` | `{username, password}` | `200 {id, username}` + cookie. `401` (also for disabled users), `429 rate_limited` (after repeated failures; `Retry-After` header) |
 | `POST /api/auth/logout` | – | `204` |
-| `POST /api/auth/password` | `{currentPassword, newPassword, username?}` | `200 {username}`. Invalidates all other sessions; re-issues the caller's cookie |
-| `GET /api/auth/tokens` | – | `{items: ApiToken[]}` |
+| `POST /api/auth/password` | `{currentPassword, newPassword, username?}` | `200 {id, username}`. Signs out the caller's other sessions; re-issues the caller's cookie |
+| `GET /api/auth/tokens` | – | `{items: ApiToken[]}`: the caller's own tokens |
 | `POST /api/auth/tokens` | `{name}` | `201 {token: string, item: ApiToken}` — `token` is shown only once |
-| `DELETE /api/auth/tokens/{id}` | – | `204` |
+| `DELETE /api/auth/tokens/{id}` | – | `204`; `404` for another user's token |
 
-Password rules: 8–128 characters. Username: 1–64 characters.
+Password rules: 8–128 characters. Username: 1–64 characters, unique regardless of case.
 
 ```ts
+type AuthState = {
+  initialized: boolean       // an enabled administrator exists
+  setupAvailable: boolean    // the setup form applies: first start, or recovery after -reset-auth
+  authenticated: boolean
+  userId?: string; username?: string
+  role?: "admin" | "member"
+  tenantId?: string; tenantName?: string   // members only
+}
 type ApiToken = { id: string; name: string; prefix: string; createdAt: string }
 ```
+
+Upgrading from a single-admin release keeps working credentials:
+
+- A standalone node turns the old administrator, its API tokens and its open sessions into the first administrator account at startup.
+- A cluster does the same through the configuration writer once the nodes are paired.
+
+From then on, the writer's accounts are the cluster's accounts. A node that was set up before pairing adopts them, and its old local administrator is dropped once the shared accounts exist.
+
+## Users and tenants
+
+Only administrators can call these endpoints.
+
+A tenant owns a set of local port ranges. Its members can create rules only with listen ports inside those ranges. Ranges of different tenants must not overlap. A member cannot pick or change a rule's `owner`: rules they create belong to their tenant. Members may set per-rule ACLs and limits, and may use any target host.
+
+| Method & path | Body | Response |
+|---|---|---|
+| `GET /api/users` | – | `{items: User[]}` |
+| `GET /api/users/{id}` | – | `User` |
+| `POST /api/users` | `{username, password, role?, tenantId?}` | `201 User`. `role` defaults to `member`; members need `tenantId` |
+| `PUT /api/users/{id}` | any of `{username, password, role, tenantId, disabled}` | `User`. A password change or disabling signs the user out everywhere; role and tenant changes apply to existing sessions immediately |
+| `DELETE /api/users/{id}` | – | `204`; also revokes the user's tokens |
+| `GET /api/tenants` | – | `{items: Tenant[]}` |
+| `GET /api/tenants/{id}` | – | `Tenant` |
+| `POST /api/tenants` | `{id, name, portRanges, quota}` | `201 Tenant` |
+| `PUT /api/tenants/{id}` | `{name, portRanges, quota}` (full replacement) | `Tenant`. `400 validation` if existing rules of the tenant would fall outside the new ranges |
+| `DELETE /api/tenants/{id}` | – | `204`; `409 conflict` while users or rules still belong to it |
+| `POST /api/tenants/{id}/usage/reset` | – | `Tenant`; starts a new traffic period now, on every node |
+
+Members read their own tenant with `GET /api/tenant`. It returns the same shape, with `users` set to 0.
+
+Administrators cannot demote, disable or delete themselves, or remove the last enabled administrator. Any of these returns `409 conflict`.
+
+```ts
+type User = {
+  id: string; username: string
+  role: "admin" | "member"
+  tenantId?: string
+  disabled: boolean
+  tokens: number             // API tokens owned
+  createdAt: string
+}
+
+type Tenant = {
+  id: string                 // chosen on create, same rules as rule ids
+  name: string
+  portRanges: [number, number][]   // inclusive local port spans
+  quota: {
+    maxRules?: number        // rules the tenant may own; 0 = unlimited
+    monthlyBytes?: number    // up+down traffic per period across both nodes; 0 = unlimited
+    resetDay?: number        // 1-28, day of month (UTC) a period starts; default 1
+  }
+  usageResetAt?: string      // last manual usage reset
+  createdAt: string
+  rules: number; users: number
+  usage: { since: string; bytes: number }   // traffic in the current period
+  suspended: boolean         // over its monthly traffic quota
+}
+```
+
+**Quotas.**
+
+- Creating or importing more rules than `maxRules` allows returns `409 quota_exceeded`.
+- Traffic is counted per node and persisted in `dataDir/tenant-usage.json`. Paired nodes exchange their counts on every heartbeat, so the limit applies to the sum over both nodes.
+- When a tenant reaches `monthlyBytes`, its rules stop and their connections are closed. Their `runtime.state` becomes `suspended`.
+- They resume automatically when a new period starts, when the limit is raised, or after a usage reset.
+- Enforcement checks the count every few seconds, so a tenant can exceed the limit slightly before the cut-off.
 
 ## Types
 
@@ -81,6 +173,8 @@ type Rule = {
   localPortRange?: [number, number]   // ... or a one-to-one port range; same length on both sides
   targetPortRange?: [number, number]
   remark?: string
+  owner?: string             // tenant id; empty = administrators only. Forced to the caller's tenant for members;
+                             // an administrator's PUT without the field keeps the current owner
   acl?: {
     mode: "allow" | "deny"   // allow: only listed sources; deny: all except listed
     cidrs: string[]          // IPs or CIDRs, IPv4/IPv6, e.g. "10.0.0.0/8", "203.0.113.7"
@@ -92,8 +186,9 @@ type Rule = {
   }
 }
 
-type RuleState = "running" | "partial" | "error" | "stopped"
-// running: all listeners up; partial: some ports failed; error: none up; stopped: status inactive
+type RuleState = "running" | "partial" | "error" | "stopped" | "suspended"
+// running: all listeners up; partial: some ports failed; error: none up; stopped: status inactive;
+// suspended: active, but the owning tenant is over its traffic quota
 
 type Counters = {
   activeConnections: number
@@ -154,7 +249,7 @@ type MetricPoint = {
 |---|---|
 | `GET /health` | legacy health check: `200 {status:"healthy",...}` when at least one listener is up, else `503` |
 | `GET /api/version` | `{version, commit, buildTime, updateChannel, updateRepo, updateSource}` |
-| `GET /api/overview` | `Overview` |
+| `GET /api/overview` | `Overview` (for members: counts and totals of their tenant only, without host details) |
 | `POST /api/system/restart` | `202 {}` — re-execs the process (Unix); `501 not_supported` on Windows |
 
 ```ts
@@ -163,8 +258,8 @@ type Overview = {
   startedAt: string; uptime: number /* seconds */
   goVersion: string; os: string; arch: string; cpus: number; goroutines: number
   memory: { sys: number; heapAlloc: number; heapInuse: number }   // bytes
-  rules: { total: number; active: number; running: number; partial: number; error: number }
-  totals: Counters                                                 // across all rules
+  rules: { total: number; active: number; running: number; partial: number; error: number; suspended: number }
+  totals: Counters                                                 // across the visible rules
   configPath: string
 }
 ```
@@ -184,7 +279,14 @@ type Overview = {
 | `POST /api/rules/batch` | `{action: "enable"\|"disable"\|"delete", ids: string[]}` | `{ok: string[], failed: {id, message}[]}` |
 | `GET /api/rules/export` | – | `{forward: Rule[]}` with `Content-Disposition: attachment` |
 | `POST /api/rules/import` | `{forward: Rule[], mode: "merge"\|"replace"}` | `{added, updated, removed: number}` — merge upserts by id; replace drops rules not in the payload |
-| `POST /api/config/reload` | – | `{added, updated, removed}` — re-reads node settings and, in standalone mode, the versioned rules snapshot |
+| `POST /api/config/reload` | – | `{added, updated, removed}` — administrators only; re-reads node settings and, in standalone mode, the versioned rules snapshot |
+
+Members see and change only their tenant's rules. Other rules return `404`. Import with `mode: "replace"` replaces only the caller's own rules, and export contains only those.
+
+Further errors for members:
+
+- A listen port outside the tenant's ranges returns `400 validation` with `field: "localPort"`. The same field is used for port ranges.
+- A conflict with a rule the caller cannot see returns `409 conflict` without naming that rule.
 
 Validation failures return `400 validation` with `field` set (e.g. `"localPort"`, `"acl.cidrs[2]"`, `"localPortRange"`). Duplicate id → `409 conflict`. Listen conflicts with another active rule (same type, overlapping host:port) → `409 conflict`. A rule whose ports fail to bind at the OS level is still saved; its `runtime.state` is `error`/`partial` with `failures`.
 
@@ -206,7 +308,11 @@ Changes are hot-applied: editing only `name`, `remark`, `acl`, `limits` or the t
 | `GET /api/metrics/history?range={1h\|24h\|7d\|30d}&rule={id}` | `{step: number, points: MetricPoint[]}` — `1h`/`24h` use 60s buckets, `7d`/`30d` use 3600s buckets. Zero buckets are included so the series is continuous |
 | `GET /api/metrics/top?range={1h\|24h\|7d\|30d}` | `{items: {ruleId, name, up, down, conns}[]}` sorted by `up+down` desc |
 
-History is persisted in `dataDir` and survives restarts.
+History is persisted in `dataDir` and survives restarts. For members:
+
+- `rule` must be one of their rules (otherwise `404`).
+- Omitting `rule` returns the tenant's combined series.
+- `top` lists only their rules.
 
 ## Live events (Server-Sent Events)
 
@@ -215,9 +321,9 @@ History is persisted in `dataDir` and survives restarts.
 | Event | Data | When |
 |---|---|---|
 | `stats` | `{t: number, totals: Counters, rules: Record<ruleId, Counters & {state: RuleState}>}` | every second |
-| `rules` | `{action: "created"\|"updated"\|"deleted"\|"reloaded", id?: string}` | after any rule change — the UI should refetch rule queries |
+| `rules` | `{action: "created"\|"updated"\|"deleted"\|"reloaded", id?: string}` | after any rule change — the UI should refetch rule queries. Members receive `stats` for their rules only, and `rules` events about other rules without `id` |
 
-`GET /api/logs/stream?level={error\|warn\|info\|debug\|trace}` — SSE, event `log` with a `LogEntry` per record at or above `level` (default: current log level). On connect, send nothing historical; use `GET /api/logs` for backlog.
+`GET /api/logs/stream?level={error\|warn\|info\|debug\|trace}` — SSE, event `log` with a `LogEntry` per record at or above `level` (default: current log level). On connect, send nothing historical; use `GET /api/logs` for backlog. Members receive only records tagged with one of their rules (`attrs.ruleId`), here and in `GET /api/logs`.
 
 ## Logs
 
@@ -225,9 +331,11 @@ History is persisted in `dataDir` and survives restarts.
 |---|---|---|
 | `GET /api/logs?limit={n}&level={lvl}&q={text}` | – | `{items: LogEntry[]}` oldest→newest, from an in-memory ring (last 2000 records). `limit` default 500 |
 | `GET /api/log-level` | – | `{level: string, levels: string[]}` |
-| `PUT /api/log-level` | `{level}` | `{level}` — applies immediately, persisted |
+| `PUT /api/log-level` | `{level}` | `{level}` — administrators only; applies immediately, persisted |
 
 ## Settings
+
+Settings, self-update, DNS, node and cluster endpoints are restricted to administrators.
 
 | Method & path | Body | Response |
 |---|---|---|

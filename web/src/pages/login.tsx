@@ -1,5 +1,6 @@
 import * as React from "react"
 import { useForm } from "react-hook-form"
+import { Link } from "react-router"
 import { zodResolver } from "@hookform/resolvers/zod"
 import { CircleAlertIcon } from "lucide-react"
 import { z } from "zod"
@@ -15,17 +16,25 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
-import { Field, FieldError, FieldGroup, FieldLabel } from "@/components/ui/field"
+import {
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldGroup,
+  FieldLabel,
+} from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
 import { useI18n } from "@/i18n"
 import { api, isApiError } from "@/lib/api"
 import { errorMessage } from "@/lib/errors"
+import { useAuthState } from "@/lib/queries"
 import { signedIn } from "@/lib/session"
 
 export default function LoginPage() {
   const { t } = useI18n()
   const [formError, setFormError] = React.useState<string | null>(null)
+  const recoverable = !!useAuthState().data?.setupAvailable
 
   const schema = React.useMemo(
     () =>
@@ -48,7 +57,7 @@ export default function LoginPage() {
     try {
       const res = await api.auth.login(values)
       // The auth gate redirects to ?next= once the state flips.
-      signedIn(res.username)
+      signedIn(res)
     } catch (error) {
       if (isApiError(error) && error.status === 401) {
         setFormError(t("auth.login.invalid"))
@@ -106,6 +115,11 @@ export default function LoginPage() {
                 {isSubmitting && <Spinner data-icon="inline-start" />}
                 {isSubmitting ? t("auth.login.submitting") : t("auth.login.submit")}
               </Button>
+              {recoverable && (
+                <FieldDescription className="text-center">
+                  <Link to="/setup">{t("auth.login.recover")}</Link>
+                </FieldDescription>
+              )}
             </FieldGroup>
           </form>
         </CardContent>

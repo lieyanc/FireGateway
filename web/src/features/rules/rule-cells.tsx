@@ -10,6 +10,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover"
 import { useI18n } from "@/i18n"
+import { useSession } from "@/lib/queries"
 import { useRuleStats } from "@/lib/stats-store"
 import type { RuleView } from "@/lib/types"
 import { formatListen, formatTarget } from "@/features/rules/utils"
@@ -111,6 +112,7 @@ export function RuleRoute({ rule }: { rule: RuleView }) {
 }
 
 export function RuleNameCell({ rule }: { rule: RuleView }) {
+  const { isAdmin } = useSession()
   return (
     <div className="flex min-w-0 flex-col">
       <Link
@@ -119,7 +121,10 @@ export function RuleNameCell({ rule }: { rule: RuleView }) {
       >
         {rule.name || rule.id}
       </Link>
-      <span className="truncate font-mono text-xs text-muted-foreground">{rule.id}</span>
+      <span className="truncate font-mono text-xs text-muted-foreground">
+        {rule.id}
+        {isAdmin && rule.owner && ` · ${rule.owner}`}
+      </span>
     </div>
   )
 }

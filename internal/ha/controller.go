@@ -60,7 +60,18 @@ type Controller struct {
 	peerFault    bool
 	prepared     string
 	now          func() time.Time
+	usage        UsageExchange
 }
+
+// UsageExchange shares per-tenant traffic counts with the peer so quotas
+// cover both nodes.
+type UsageExchange interface {
+	Local() map[string]config.TenantUsage
+	SetPeer(map[string]config.TenantUsage)
+}
+
+// SetUsage installs the usage exchange; call it before Run.
+func (c *Controller) SetUsage(u UsageExchange) { c.usage = u }
 
 func NewController(store *config.Store, mgr *gateway.Manager, upstream Upstream, peer PeerAPI) (*Controller, error) {
 	cfg := *store.Get().Cluster
@@ -95,6 +106,9 @@ func (c *Controller) peerState() PeerState {
 	out := PeerState{NodeID: c.node, PairID: d.PairID, Paired: d.Paired, Writer: d.Writer, Epoch: d.Epoch, Revision: d.Committed.Revision, Checksum: d.Committed.Checksum, PreparedChecksum: prepared, Frozen: d.Frozen, Takeover: d.Takeover, Degraded: d.Degraded, Transferring: d.Transfer != nil}
 	if d.Pending != nil {
 		out.PendingID = d.Pending.ID
+	}
+	if c.usage != nil {
+		out.Usage = c.usage.Local()
 	}
 	return out
 }
@@ -202,9 +216,17 @@ func errorReply(err error) Reply {
 	body, _ := json.Marshal(fields)
 	return Reply{Status: status, Body: body}
 }
-func (c *Controller) Mutate(ctx context.Context, req Mutation, apply func(Mutation) Reply) Reply {
-	if len(req.ID) < 8 || len(req.ID) > 128 || strings.ContainsAny(req.ID, "\r\n") || req.Expected == "" {
-		return errorReply(fmt.Errorf("Idempotency-Key and If-Match are required for cluster writes: %w", config.ErrRevisionConflict))
+// Executor applies replicated management mutations on the writer.
+type Executor interface {
+	// Version returns the caller-visible version a request must match, or ""
+	// when the mutation carries no precondition.
+	Version(req Mutation, committed config.RuleSet) string
+	Execute(req Mutation) Reply
+}
+
+func (c *Controller) Mutate(ctx context.Context, req Mutation, exec Executor) Reply {
+	if len(req.ID) < 8 || len(req.ID) > 128 || strings.ContainsAny(req.ID, "\r\n") {
+		return errorReply(fmt.Errorf("Idempotency-Key is required for cluster writes: %w", config.ErrRevisionConflict))
 	}
 	d := c.replica.state()
 	if d.Writer != c.node {
@@ -218,6 +240,11 @@ func (c *Controller) Mutate(ctx context.Context, req Mutation, apply func(Mutati
 		if out.Reply == nil {
 			return errorReply(errors.New("peer omitted mutation result"))
 		}
+		// The writer replies after the commit reached this node; apply it now
+		// so the caller reads its own write here.
+		c.edit.Lock()
+		_ = c.materialize()
+		c.edit.Unlock()
 		return *out.Reply
 	}
 	c.edit.Lock()
@@ -226,11 +253,19 @@ func (c *Controller) Mutate(ctx context.Context, req Mutation, apply func(Mutati
 		return errorReply(err)
 	}
 	raw, _ := json.Marshal(struct {
-		Method, Path, Expected string
-		Body                   json.RawMessage
-	}{req.Method, req.Path, req.Expected, req.Body})
+		Method, Path, Expected, Actor string
+		Body                          json.RawMessage
+	}{req.Method, req.Path, req.Expected, req.Actor, req.Body})
 	hash := digest(raw)
-	cached, err := c.replica.BeginEdit(req.ID, hash, req.Expected)
+	cached, err := c.replica.BeginEdit(req.ID, hash, func(committed config.RuleSet) error {
+		if v := exec.Version(req, committed); v != "" && v != req.Expected {
+			if req.Expected == "" {
+				return fmt.Errorf("If-Match is required for rule writes: %w", config.ErrRevisionConflict)
+			}
+			return config.ErrRevisionConflict
+		}
+		return nil
+	})
 	if err != nil {
 		return errorReply(err)
 	}
@@ -247,9 +282,9 @@ func (c *Controller) Mutate(ctx context.Context, req Mutation, apply func(Mutati
 		_ = c.replica.EndEdit(req.ID, hash, reply)
 		return reply
 	}
-	reply := apply(req)
+	reply := exec.Execute(req)
 	d = c.replica.state()
-	reply.Version = d.Committed.Checksum
+	reply.Version = exec.Version(req, d.Committed)
 	reply.Durability = "replicated"
 	if d.Pending != nil {
 		reply.Durability = "pending"
@@ -295,6 +330,9 @@ func (c *Controller) SyncStep(ctx context.Context) error {
 		c.status.SyncError = err.Error()
 	} else {
 		c.peerInfo = out.State
+		if c.usage != nil {
+			c.usage.SetPeer(out.State.Usage)
+		}
 		c.offlineSince = time.Time{}
 		c.peerFault = false
 		c.status.PeerState = "online"

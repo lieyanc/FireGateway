@@ -211,7 +211,7 @@ func (r *Replica) Bootstrap(ctx context.Context) error {
 		return errors.New("initialize on the configured initialWriter")
 	}
 	if d.Pending == nil {
-		next := config.WithWriter(d.Committed, 1, r.node, d.Committed.Rules)
+		next := config.WithWriter(d.Committed, 1, r.node, d.Committed)
 		d.PairID = nonce()
 		d.Epoch = 1
 		d.Pending = &Transaction{ID: nonce(), PairID: d.PairID, Kind: "pair", Phase: "prepare", Next: next}
@@ -234,7 +234,7 @@ func (r *Replica) Commit(previous, next config.RuleSet) (config.RuleSet, error) 
 	if d.Committed.Checksum != previous.Checksum {
 		return previous, config.ErrRevisionConflict
 	}
-	next = config.WithWriter(previous, d.Epoch, r.node, next.Rules)
+	next = config.WithWriter(previous, d.Epoch, r.node, next)
 	if err := next.Verify(); err != nil {
 		return previous, err
 	}
@@ -353,7 +353,7 @@ func (r *Replica) Prepare(tx Transaction) error {
 		if !d.Paired || d.Writer != r.cfg.PeerID || d.PairID != tx.PairID || d.Epoch != tx.Next.WriterEpoch || tx.Expected != d.Committed.Checksum || tx.Next.ParentChecksum != tx.Expected {
 			return config.ErrRevisionConflict
 		}
-		want := config.WithWriter(d.Committed, d.Epoch, d.Writer, tx.Next.Rules)
+		want := config.WithWriter(d.Committed, d.Epoch, d.Writer, tx.Next)
 		if want.Checksum != tx.Next.Checksum {
 			return config.ErrRevisionConflict
 		}
@@ -424,7 +424,20 @@ func (r *Replica) MarkSwitched() error {
 	d.Switched = true
 	return r.save(d)
 }
-func (r *Replica) BeginEdit(id, hash, expected string) (*Reply, error) {
+// Precondition checks a new request against the committed snapshot.
+type Precondition func(committed config.RuleSet) error
+
+// Expect requires the committed snapshot to have the given checksum.
+func Expect(checksum string) Precondition {
+	return func(committed config.RuleSet) error {
+		if checksum == "" || committed.Checksum != checksum {
+			return config.ErrRevisionConflict
+		}
+		return nil
+	}
+}
+
+func (r *Replica) BeginEdit(id, hash string, check Precondition) (*Reply, error) {
 	r.op.Lock()
 	defer r.op.Unlock()
 	d := r.state()
@@ -446,8 +459,8 @@ func (r *Replica) BeginEdit(id, hash, expected string) (*Reply, error) {
 	if !d.Paired || d.Writer != r.node || d.Frozen || d.Transfer != nil {
 		return nil, ErrFrozen
 	}
-	if expected == "" || d.Committed.Checksum != expected {
-		return nil, config.ErrRevisionConflict
+	if err := check(d.Committed); err != nil {
+		return nil, err
 	}
 	r.editID = id
 	r.editHash = hash
@@ -483,7 +496,7 @@ func (r *Replica) Transfer(ctx context.Context) error {
 	if !d.Paired || d.Writer != r.node || d.Pending != nil || d.Degraded {
 		return ErrFrozen
 	}
-	d.Transfer = &Handoff{ID: nonce(), To: r.cfg.PeerID, Epoch: d.Epoch + 1, Snapshot: config.WithWriter(d.Committed, d.Epoch+1, r.cfg.PeerID, d.Committed.Rules)}
+	d.Transfer = &Handoff{ID: nonce(), To: r.cfg.PeerID, Epoch: d.Epoch + 1, Snapshot: config.WithWriter(d.Committed, d.Epoch+1, r.cfg.PeerID, d.Committed)}
 	if err := r.save(d); err != nil {
 		return err
 	}
@@ -527,7 +540,7 @@ func (r *Replica) ReceiveHandoff(pair string, h Handoff, commit bool) error {
 		return nil
 	}
 	if !commit {
-		if d.Pending != nil || d.Degraded || d.Writer != r.cfg.PeerID || h.Epoch != d.Epoch+1 || h.Snapshot.Checksum != config.WithWriter(d.Committed, h.Epoch, r.node, d.Committed.Rules).Checksum {
+		if d.Pending != nil || d.Degraded || d.Writer != r.cfg.PeerID || h.Epoch != d.Epoch+1 || h.Snapshot.Checksum != config.WithWriter(d.Committed, h.Epoch, r.node, d.Committed).Checksum {
 			return config.ErrRevisionConflict
 		}
 		if d.Transfer != nil && d.Transfer.ID != h.ID {
@@ -564,7 +577,7 @@ func (r *Replica) Promote(fenced bool) error {
 	}
 	d.Epoch++
 	d.Writer = r.node
-	d.Committed = config.WithWriter(d.Committed, d.Epoch, r.node, d.Committed.Rules)
+	d.Committed = config.WithWriter(d.Committed, d.Epoch, r.node, d.Committed)
 	d.Pending = nil
 	d.Transfer = nil
 	d.Frozen = false

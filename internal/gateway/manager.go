@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"reflect"
 	"slices"
 	"strconv"
@@ -21,7 +22,10 @@ import (
 var ErrNotFound = errors.New("rule not found")
 
 // ConflictError reports a duplicate id or an overlapping listen address.
-type ConflictError struct{ Msg string }
+type ConflictError struct {
+	Msg   string
+	Rules []config.RuleID // the rules involved, if any
+}
 
 func (e *ConflictError) Error() string { return e.Msg }
 
@@ -30,6 +34,8 @@ const (
 	StatePartial = "partial"
 	StateError   = "error"
 	StateStopped = "stopped"
+	// StateSuspended means the owning tenant exhausted its traffic quota.
+	StateSuspended = "suspended"
 )
 
 type Manager struct {
@@ -44,6 +50,7 @@ type Manager struct {
 	prepared   bool
 	leaseUntil atomic.Pointer[time.Time]
 	applied    atomic.Int64
+	suspended  atomic.Pointer[map[string]bool] // tenants over their traffic quota
 }
 
 func New(store *config.Store, broker *events.Broker) *Manager {
@@ -68,7 +75,7 @@ func (m *Manager) Start() {
 		switch {
 		case r.ID == "":
 			slog.Warn("skipping invalid config entry", "index", i, "reason", "missing id")
-		case r.Active():
+		case m.runnable(r):
 			m.start(r)
 		default:
 			slog.Info("skipping inactive rule", "ruleId", string(r.ID), "name", r.Name, "status", r.Status)
@@ -127,10 +134,73 @@ func (m *Manager) stop(id config.RuleID) {
 	}
 }
 
+// runnable reports whether a rule should be listening: active and not
+// suspended by its tenant's quota.
+func (m *Manager) runnable(r *config.Rule) bool {
+	if !r.Active() {
+		return false
+	}
+	if set := m.suspended.Load(); set != nil && r.Owner != "" {
+		return !(*set)[r.Owner]
+	}
+	return true
+}
+
+// Suspended reports whether a tenant's rules are suspended.
+func (m *Manager) Suspended(tenant string) bool {
+	set := m.suspended.Load()
+	return set != nil && (*set)[tenant]
+}
+
+// SetSuspended stops the rules of the given tenants, closing their
+// connections, and resumes the rules of tenants no longer listed.
+func (m *Manager) SetSuspended(tenants map[string]bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	before := m.suspended.Load()
+	if before == nil && len(tenants) == 0 || before != nil && reflect.DeepEqual(*before, tenants) {
+		return
+	}
+	was := make(map[config.RuleID]bool)
+	rules := m.List()
+	for i := range rules {
+		was[rules[i].ID] = m.runnable(&rules[i])
+	}
+	set := maps.Clone(tenants)
+	m.suspended.Store(&set)
+	changed := false
+	for i := range rules {
+		r := &rules[i]
+		switch now := m.runnable(r); {
+		case was[r.ID] && !now:
+			m.stop(r.ID)
+			changed = true
+		case !was[r.ID] && now && (!m.clustered || m.prepared):
+			m.start(r)
+			changed = true
+		}
+	}
+	for t := range tenants {
+		if before == nil || !(*before)[t] {
+			slog.Warn("tenant traffic quota exceeded; rules suspended", "tenant", t)
+		}
+	}
+	if before != nil {
+		for t := range *before {
+			if !tenants[t] {
+				slog.Info("tenant rules resumed", "tenant", t)
+			}
+		}
+	}
+	if changed {
+		m.publish("reloaded", "")
+	}
+}
+
 // reconcile brings the runtime of one rule from old to next. Either may be
 // nil (created / deleted). Policy-only changes are applied in place.
 func (m *Manager) reconcile(old, next *config.Rule) {
-	if next == nil || !next.Active() {
+	if next == nil || !m.runnable(next) {
 		if next != nil {
 			m.stop(next.ID)
 		} else {
@@ -199,6 +269,9 @@ func (m *Manager) runtime(r *config.Rule, withSnapshot bool) Runtime {
 	if !r.Active() || (m.clustered && !m.Serving()) {
 		return Runtime{State: StateStopped}
 	}
+	if !m.runnable(r) {
+		return Runtime{State: StateSuspended, Error: "tenant traffic quota exceeded"}
+	}
 	m.rmu.RLock()
 	rn, errMsg := m.runners[r.ID], m.errs[r.ID]
 	m.rmu.RUnlock()
@@ -262,7 +335,7 @@ func checkConflicts(rules []config.Rule) error {
 		for j := i + 1; j < len(rules); j++ {
 			b := &rules[j]
 			if b.Active() && a.ListenOverlaps(b) {
-				return &ConflictError{fmt.Sprintf("rule %q listens on an address that overlaps rule %q", b.ID, a.ID)}
+				return &ConflictError{fmt.Sprintf("rule %q listens on an address that overlaps rule %q", b.ID, a.ID), []config.RuleID{a.ID, b.ID}}
 			}
 		}
 	}
@@ -275,7 +348,7 @@ func prepare(r *config.Rule) error {
 }
 
 // Create adds a rule, generating an id when empty.
-func (m *Manager) Create(r config.Rule) (config.Rule, error) {
+func (m *Manager) Create(scope Scope, r config.Rule) (config.Rule, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	_, err := m.store.Update(func(c *config.Config) error {
@@ -286,10 +359,13 @@ func (m *Manager) Create(r config.Rule) (config.Rule, error) {
 			return err
 		}
 		if c.RuleIndex(r.ID) >= 0 {
-			return &ConflictError{fmt.Sprintf("rule id %q already exists", r.ID)}
+			return &ConflictError{Msg: fmt.Sprintf("rule id %q already exists", r.ID)}
+		}
+		if err := scope.admit(c, &r, nil); err != nil {
+			return err
 		}
 		c.Forward = append(c.Forward, r)
-		return m.validate(c.Forward)
+		return scope.validate(m, c)
 	})
 	if err != nil {
 		return r, err
@@ -301,14 +377,16 @@ func (m *Manager) Create(r config.Rule) (config.Rule, error) {
 }
 
 // Update replaces a rule; the id is taken from the path, not the body.
-func (m *Manager) Update(id config.RuleID, r config.Rule) (config.Rule, error) {
+func (m *Manager) Update(scope Scope, id config.RuleID, r config.Rule) (config.Rule, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r.ID = id
 	if err := prepare(&r); err != nil {
 		return r, err
 	}
-	old, err := m.replace(id, func(*config.Rule) config.Rule { return r })
+	old, err := m.replace(scope, id, func(c *config.Config, old *config.Rule) (config.Rule, error) {
+		return r, scope.admit(c, &r, old)
+	})
 	if err != nil {
 		return r, err
 	}
@@ -319,33 +397,37 @@ func (m *Manager) Update(id config.RuleID, r config.Rule) (config.Rule, error) {
 }
 
 // replace swaps one rule in the config and returns the previous version.
-func (m *Manager) replace(id config.RuleID, fn func(*config.Rule) config.Rule) (old config.Rule, err error) {
+func (m *Manager) replace(scope Scope, id config.RuleID, fn func(*config.Config, *config.Rule) (config.Rule, error)) (old config.Rule, err error) {
 	_, err = m.store.Update(func(c *config.Config) error {
-		i := c.RuleIndex(id)
+		i := scope.find(c, id)
 		if i < 0 {
 			return ErrNotFound
 		}
 		old = c.Forward[i]
-		c.Forward[i] = fn(&old)
-		return m.validate(c.Forward)
+		next, err := fn(c, &old)
+		if err != nil {
+			return err
+		}
+		c.Forward[i] = next
+		return scope.validate(m, c)
 	})
 	return old, err
 }
 
-func (m *Manager) Delete(id config.RuleID) error {
+func (m *Manager) Delete(scope Scope, id config.RuleID) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.delete(id); err != nil {
+	if err := m.delete(scope, id); err != nil {
 		return err
 	}
 	m.publish("deleted", id)
 	return nil
 }
 
-func (m *Manager) delete(id config.RuleID) error {
+func (m *Manager) delete(scope Scope, id config.RuleID) error {
 	var old config.Rule
 	_, err := m.store.Update(func(c *config.Config) error {
-		i := c.RuleIndex(id)
+		i := scope.find(c, id)
 		if i < 0 {
 			return ErrNotFound
 		}
@@ -362,26 +444,26 @@ func (m *Manager) delete(id config.RuleID) error {
 }
 
 // SetActive enables or disables a rule.
-func (m *Manager) SetActive(id config.RuleID, active bool) (config.Rule, error) {
+func (m *Manager) SetActive(scope Scope, id config.RuleID, active bool) (config.Rule, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r, err := m.setActive(id, active)
+	r, err := m.setActive(scope, id, active)
 	if err == nil {
 		m.publish("updated", id)
 	}
 	return r, err
 }
 
-func (m *Manager) setActive(id config.RuleID, active bool) (config.Rule, error) {
+func (m *Manager) setActive(scope Scope, id config.RuleID, active bool) (config.Rule, error) {
 	status := config.StatusInactive
 	if active {
 		status = config.StatusActive
 	}
 	var next config.Rule
-	old, err := m.replace(id, func(o *config.Rule) config.Rule {
+	old, err := m.replace(scope, id, func(_ *config.Config, o *config.Rule) (config.Rule, error) {
 		next = *o
 		next.Status = status
-		return next
+		return next, nil
 	})
 	if err != nil {
 		return next, err
@@ -394,15 +476,15 @@ func (m *Manager) setActive(id config.RuleID, active bool) (config.Rule, error) 
 }
 
 // Restart re-binds an active rule's listeners.
-func (m *Manager) Restart(id config.RuleID) (config.Rule, error) {
+func (m *Manager) Restart(scope Scope, id config.RuleID) (config.Rule, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.Get(id)
-	if !ok {
+	if !ok || !scope.Owns(&r) {
 		return r, ErrNotFound
 	}
 	m.stop(id)
-	if r.Active() && (!m.clustered || m.prepared) {
+	if m.runnable(&r) && (!m.clustered || m.prepared) {
 		m.start(&r)
 	}
 	m.publish("updated", id)
@@ -421,7 +503,7 @@ type BatchFailed struct {
 
 // Batch validates individual items, then persists all accepted changes in a
 // single publication so a replicated request cannot partially commit twice.
-func (m *Manager) Batch(action string, ids []config.RuleID) (BatchResult, error) {
+func (m *Manager) Batch(scope Scope, action string, ids []config.RuleID) (BatchResult, error) {
 	res := BatchResult{OK: []string{}, Failed: []BatchFailed{}}
 	if action != "enable" && action != "disable" && action != "delete" {
 		return res, &config.FieldError{Field: "action", Msg: "action must be enable, disable or delete"}
@@ -431,7 +513,7 @@ func (m *Manager) Batch(action string, ids []config.RuleID) (BatchResult, error)
 	before := m.List()
 	cfg, err := m.store.Update(func(c *config.Config) error {
 		for _, id := range ids {
-			i := c.RuleIndex(id)
+			i := scope.find(c, id)
 			if i < 0 {
 				res.Failed = append(res.Failed, BatchFailed{string(id), ErrNotFound.Error()})
 				continue
@@ -446,7 +528,7 @@ func (m *Manager) Batch(action string, ids []config.RuleID) (BatchResult, error)
 					c.Forward[i].Status = "inactive"
 				}
 			}
-			if err := m.validate(c.Forward); err != nil {
+			if err := scope.validate(m, c); err != nil {
 				c.Forward = saved
 				res.Failed = append(res.Failed, BatchFailed{string(id), err.Error()})
 				continue
@@ -469,9 +551,9 @@ type SyncResult struct {
 	Removed int `json:"removed"`
 }
 
-// Import merges or replaces rules. All rules are validated before anything
-// is applied, so a bad payload changes nothing.
-func (m *Manager) Import(rules []config.Rule, replace bool) (SyncResult, error) {
+// Import merges or replaces rules within the scope. All rules are validated
+// before anything is applied, so a bad payload changes nothing.
+func (m *Manager) Import(scope Scope, rules []config.Rule, replace bool) (SyncResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	seen := make(map[config.RuleID]bool, len(rules))
@@ -479,7 +561,7 @@ func (m *Manager) Import(rules []config.Rule, replace bool) (SyncResult, error) 
 		r := &rules[i]
 		if r.ID != "" {
 			if seen[r.ID] {
-				return SyncResult{}, &ConflictError{fmt.Sprintf("duplicate rule id %q in import", r.ID)}
+				return SyncResult{}, &ConflictError{Msg: fmt.Sprintf("duplicate rule id %q in import", r.ID)}
 			}
 			seen[r.ID] = true
 		}
@@ -487,11 +569,12 @@ func (m *Manager) Import(rules []config.Rule, replace bool) (SyncResult, error) 
 	var before []config.Rule
 	cfg, err := m.store.Update(func(c *config.Config) error {
 		before = c.Forward
-		var out []config.Rule
-		if !replace {
-			out = slices.Clone(c.Forward)
+		out := slices.Clone(c.Forward)
+		if replace {
+			// Rules outside the scope are kept, not replaced.
+			out = slices.DeleteFunc(out, func(r config.Rule) bool { return scope.Owns(&r) })
 		}
-		tmp := &config.Config{Forward: out}
+		tmp := &config.Config{Forward: out, Access: c.Access}
 		// Ids for rules without one must not collide with existing or
 		// incoming ids.
 		taken := &config.Config{Forward: slices.Concat(before, rules)}
@@ -507,14 +590,29 @@ func (m *Manager) Import(rules []config.Rule, replace bool) (SyncResult, error) 
 				}
 				return err
 			}
-			if j := tmp.RuleIndex(r.ID); j >= 0 {
+			j := tmp.RuleIndex(r.ID)
+			if j >= 0 && !scope.Owns(&tmp.Forward[j]) {
+				return &ConflictError{Msg: fmt.Sprintf("rule id %q is already in use", r.ID)}
+			}
+			var old *config.Rule
+			if j >= 0 {
+				old = &tmp.Forward[j]
+			}
+			if err := scope.admit(tmp, &r, old); err != nil {
+				var fe *config.FieldError
+				if errors.As(err, &fe) {
+					fe.Field = fmt.Sprintf("forward[%d].%s", i, fe.Field)
+				}
+				return err
+			}
+			if j >= 0 {
 				tmp.Forward[j] = r
 			} else {
 				tmp.Forward = append(tmp.Forward, r)
 			}
 		}
 		c.Forward = tmp.Forward
-		return m.validate(c.Forward)
+		return scope.validate(m, c)
 	})
 	if err != nil {
 		return SyncResult{}, err
@@ -539,7 +637,7 @@ func (m *Manager) Reload() (SyncResult, *config.Config, error) {
 			m.stop(id)
 		}
 		for i := range cur.Forward {
-			if cur.Forward[i].Active() {
+			if m.runnable(&cur.Forward[i]) {
 				m.start(&cur.Forward[i])
 			}
 		}
@@ -586,10 +684,25 @@ func ruleEqual(a, b *config.Rule) bool { return reflect.DeepEqual(a, b) }
 
 // Connection helpers.
 
-func (m *Manager) Connections(rule config.RuleID) []proxy.ConnInfo {
+// visible returns the ids of the rules a scope may see; nil means all.
+func (m *Manager) visible(scope Scope) map[config.RuleID]bool {
+	if scope.Tenant == "" {
+		return nil
+	}
+	out := map[config.RuleID]bool{}
+	for _, r := range m.List() {
+		if scope.Owns(&r) {
+			out[r.ID] = true
+		}
+	}
+	return out
+}
+
+func (m *Manager) Connections(scope Scope, rule config.RuleID) []proxy.ConnInfo {
+	ids := m.visible(scope)
 	var out []proxy.ConnInfo
 	for id, rn := range m.Runners() {
-		if rule == "" || rule == id {
+		if (rule == "" || rule == id) && (ids == nil || ids[id]) {
 			out = append(out, rn.Conns()...)
 		}
 	}
@@ -597,21 +710,22 @@ func (m *Manager) Connections(rule config.RuleID) []proxy.ConnInfo {
 	return out
 }
 
-func (m *Manager) CloseConn(id uint64) bool {
-	for _, rn := range m.Runners() {
-		if rn.CloseConn(id) {
+func (m *Manager) CloseConn(scope Scope, id uint64) bool {
+	ids := m.visible(scope)
+	for rule, rn := range m.Runners() {
+		if (ids == nil || ids[rule]) && rn.CloseConn(id) {
 			return true
 		}
 	}
 	return false
 }
 
-func (m *Manager) CloseRuleConns(rule config.RuleID) (int, error) {
+func (m *Manager) CloseRuleConns(scope Scope, rule config.RuleID) (int, error) {
+	if r, ok := m.Get(rule); !ok || !scope.Owns(&r) {
+		return 0, ErrNotFound
+	}
 	rn := m.Runner(rule)
 	if rn == nil {
-		if _, ok := m.Get(rule); !ok {
-			return 0, ErrNotFound
-		}
 		return 0, nil
 	}
 	return rn.CloseAll(), nil

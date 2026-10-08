@@ -1,5 +1,6 @@
 import * as React from "react"
 import { useForm } from "react-hook-form"
+import { Link } from "react-router"
 import { zodResolver } from "@hookform/resolvers/zod"
 import { CircleAlertIcon, InfoIcon } from "lucide-react"
 import { toast } from "sonner"
@@ -28,12 +29,16 @@ import { Spinner } from "@/components/ui/spinner"
 import { useI18n } from "@/i18n"
 import { api, isApiError } from "@/lib/api"
 import { errorMessage } from "@/lib/errors"
-import { authStateQuery, queryClient } from "@/lib/queries"
+import { authStateQuery, queryClient, useAuthState } from "@/lib/queries"
 import { signedIn } from "@/lib/session"
 
 export default function SetupPage() {
   const { t } = useI18n()
   const [formError, setFormError] = React.useState<string | null>(null)
+  const auth = useAuthState()
+  // Recovery (-reset-auth): the token resets or creates an administrator on an
+  // already initialized node, and signing in normally keeps working.
+  const recovery = !!(auth.data?.initialized && auth.data.setupAvailable)
 
   const schema = React.useMemo(
     () =>
@@ -69,8 +74,8 @@ export default function SetupPage() {
     setFormError(null)
     try {
       const res = await api.auth.setup({ setupToken, username, password })
-      toast.success(t("auth.setup.success"))
-      signedIn(res.username)
+      toast.success(t(recovery ? "auth.setup.recoverySuccess" : "auth.setup.success"))
+      signedIn(res)
     } catch (error) {
       if (isApiError(error) && error.status === 403) {
         form.setError("setupToken", { message: t("auth.setup.tokenInvalid") })
@@ -92,8 +97,12 @@ export default function SetupPage() {
     <AuthShell>
       <Card>
         <CardHeader>
-          <CardTitle>{t("auth.setup.title")}</CardTitle>
-          <CardDescription>{t("auth.setup.description")}</CardDescription>
+          <CardTitle>
+            {t(recovery ? "auth.setup.recoveryTitle" : "auth.setup.title")}
+          </CardTitle>
+          <CardDescription>
+            {t(recovery ? "auth.setup.recoveryDescription" : "auth.setup.description")}
+          </CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={form.handleSubmit(onSubmit)} noValidate>
@@ -158,8 +167,15 @@ export default function SetupPage() {
               </Field>
               <Button type="submit" disabled={isSubmitting}>
                 {isSubmitting && <Spinner data-icon="inline-start" />}
-                {isSubmitting ? t("auth.setup.submitting") : t("auth.setup.submit")}
+                {isSubmitting
+                  ? t("auth.setup.submitting")
+                  : t(recovery ? "auth.setup.recoverySubmit" : "auth.setup.submit")}
               </Button>
+              {recovery && (
+                <FieldDescription className="text-center">
+                  <Link to="/login">{t("auth.setup.backToLogin")}</Link>
+                </FieldDescription>
+              )}
             </FieldGroup>
           </form>
         </CardContent>

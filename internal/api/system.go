@@ -56,33 +56,43 @@ func (s *Server) version(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-func (s *Server) overview(w http.ResponseWriter, _ *http.Request) {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	rules := map[string]int{"total": 0, "active": 0, "running": 0, "partial": 0, "error": 0}
+func (s *Server) overview(w http.ResponseWriter, r *http.Request) {
+	scope := scopeOf(r)
+	rules := map[string]int{"total": 0, "active": 0, "running": 0, "partial": 0, "error": 0, "suspended": 0}
 	var totals metrics.Counters
-	for _, r := range s.Manager.List() {
+	for _, rule := range s.visibleRules(r) {
 		rules["total"]++
-		if r.Active() {
+		if rule.Active() {
 			rules["active"]++
 		}
-		rt := s.Manager.Runtime(&r)
+		rt := s.Manager.Runtime(&rule)
 		if rt.State != gateway.StateStopped {
 			rules[rt.State]++
 		}
 		totals.Add(metrics.CountersOf(rt.Snapshot, 0, 0))
+		if scope.Tenant != "" {
+			up, down := s.Sampler.Rates(rule.ID)
+			totals.RateUp += up
+			totals.RateDown += down
+		}
 	}
-	totals.RateUp, totals.RateDown = s.Sampler.GlobalRates()
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"version": version.Version, "commit": version.Commit, "buildTime": version.BuildTime,
 		"startedAt": s.Started.UTC(), "uptime": int64(time.Since(s.Started).Seconds()),
-		"goVersion": runtime.Version(), "os": runtime.GOOS, "arch": runtime.GOARCH,
-		"cpus": runtime.NumCPU(), "goroutines": runtime.NumGoroutine(),
-		"memory":     map[string]uint64{"sys": m.Sys, "heapAlloc": m.HeapAlloc, "heapInuse": m.HeapInuse},
-		"rules":      rules,
-		"totals":     totals,
-		"configPath": s.Store.Path(),
-	})
+		"rules": rules,
+	}
+	if scope.Tenant == "" {
+		// Host details are for administrators only.
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		totals.RateUp, totals.RateDown = s.Sampler.GlobalRates()
+		out["goVersion"], out["os"], out["arch"] = runtime.Version(), runtime.GOOS, runtime.GOARCH
+		out["cpus"], out["goroutines"] = runtime.NumCPU(), runtime.NumGoroutine()
+		out["memory"] = map[string]uint64{"sys": m.Sys, "heapAlloc": m.HeapAlloc, "heapInuse": m.HeapInuse}
+		out["configPath"] = s.Store.Path()
+	}
+	out["totals"] = totals
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) restart(w http.ResponseWriter, r *http.Request) {
@@ -145,7 +155,24 @@ func (s *Server) logs(w http.ResponseWriter, r *http.Request) {
 	if l, ok := logx.ParseLevel(q.Get("level")); ok {
 		lvl = l
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": logx.Recent.Query(min(limit, 2000), lvl, q.Get("q"))})
+	writeJSON(w, http.StatusOK, map[string]any{"items": logx.Recent.Query(min(limit, 2000), lvl, q.Get("q"), s.logFilter(r))})
+}
+
+// logFilter limits tenant members to the entries of their own rules; it
+// returns nil for administrators, who see every entry.
+func (s *Server) logFilter(r *http.Request) func(*logx.Entry) bool {
+	scope := scopeOf(r)
+	if scope == gateway.Admin {
+		return nil
+	}
+	return func(e *logx.Entry) bool {
+		id, ok := e.Attrs["ruleId"]
+		if !ok {
+			return false
+		}
+		rule, found := s.Manager.Get(config.RuleID(id))
+		return found && scope.Owns(&rule)
+	}
 }
 
 // Settings.

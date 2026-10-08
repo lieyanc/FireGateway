@@ -19,6 +19,9 @@ import (
 	"github.com/lieyanc/FireGateway/internal/config"
 )
 
+// Protocol 2 adds replicated accounts to snapshots and actors to mutations.
+const Protocol = 2
+
 const PeerTimeout = 8 * time.Second
 const RouterTimeout = 8 * time.Second
 const peerBodyLimit = 2 << 20
@@ -37,6 +40,8 @@ type PeerState struct {
 	Degraded         bool   `json:"degraded"`
 	PendingID        string `json:"pendingId,omitempty"`
 	Transferring     bool   `json:"transferring"`
+	// Usage is the node's own traffic count per tenant for quota checks.
+	Usage map[string]config.TenantUsage `json:"usage,omitempty"`
 }
 type Mutation struct {
 	ID       string          `json:"id"`
@@ -44,6 +49,9 @@ type Mutation struct {
 	Method   string          `json:"method"`
 	Path     string          `json:"path"`
 	Body     json.RawMessage `json:"body,omitempty"`
+	// Actor identifies the authenticated caller on the originating node: a
+	// user id, or one of the reserved "@" actors of the api package.
+	Actor string `json:"actor,omitempty"`
 }
 type PeerRequest struct {
 	Protocol    int          `json:"protocol"`
@@ -123,7 +131,7 @@ func topology(cfg config.ClusterConfig, node string) string {
 	return digest(b)
 }
 func (p *PeerClient) Call(ctx context.Context, method string, req PeerRequest) (PeerResponse, error) {
-	req.Protocol = 1
+	req.Protocol = Protocol
 	req.ClusterID = p.cfg.ID
 	req.NodeID = p.node
 	req.Receiver = p.cfg.PeerID
@@ -154,14 +162,18 @@ func (p *PeerClient) Call(ctx context.Context, method string, req PeerRequest) (
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(res.Body, 256))
+		if text := strings.TrimSpace(string(msg)); text != "" {
+			return PeerResponse{}, &PeerFault{fmt.Sprintf("peer HTTP status %d: %s", res.StatusCode, text)}
+		}
 		return PeerResponse{}, &PeerFault{fmt.Sprintf("peer HTTP status %d", res.StatusCode)}
 	}
 	var out PeerResponse
 	if err = json.NewDecoder(io.LimitReader(res.Body, peerBodyLimit)).Decode(&out); err != nil {
 		return out, &PeerFault{"invalid peer response"}
 	}
-	if out.Protocol != 1 || out.NodeID != p.cfg.PeerID {
-		return out, &PeerFault{"peer identity or protocol mismatch"}
+	if out.Protocol != Protocol || out.NodeID != p.cfg.PeerID {
+		return out, &PeerFault{fmt.Sprintf("peer identity or protocol mismatch (peer protocol %d, want %d); run the same release on both nodes", out.Protocol, Protocol)}
 	}
 	if out.Error != "" {
 		switch out.Code {
@@ -196,11 +208,15 @@ func (c *Controller) PeerHandler(mutate func(context.Context, Mutation) Reply) h
 			http.Error(w, "invalid trailing JSON", 400)
 			return
 		}
-		if req.Protocol != 1 || req.ClusterID != c.cfg.ID || req.NodeID != c.cfg.PeerID || req.Receiver != c.node || req.Topology != topology(c.cfg, c.node) {
+		if req.Protocol != Protocol {
+			http.Error(w, fmt.Sprintf("peer protocol %d is not supported (want %d); run the same release on both nodes", req.Protocol, Protocol), 400)
+			return
+		}
+		if req.ClusterID != c.cfg.ID || req.NodeID != c.cfg.PeerID || req.Receiver != c.node || req.Topology != topology(c.cfg, c.node) {
 			http.Error(w, "node identity or pair topology mismatch", 403)
 			return
 		}
-		out := PeerResponse{Protocol: 1, NodeID: c.node}
+		out := PeerResponse{Protocol: Protocol, NodeID: c.node}
 		var err error
 		switch req.Method {
 		case "heartbeat":

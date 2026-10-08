@@ -130,7 +130,7 @@ func TestWebPeerProbeUsesSavedSettingsWithoutMutations(t *testing.T) {
 		if wrongIdentity.Load() {
 			id = "impostor"
 		}
-		_ = json.NewEncoder(w).Encode(ha.PeerResponse{Protocol: 1, NodeID: id, State: &ha.PeerState{NodeID: id}})
+		_ = json.NewEncoder(w).Encode(ha.PeerResponse{Protocol: ha.Protocol, NodeID: id, State: &ha.PeerState{NodeID: id}})
 	}))
 	defer peer.Close()
 	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { routerCalls.Add(1); w.WriteHeader(500) }))

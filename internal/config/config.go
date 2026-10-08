@@ -28,6 +28,9 @@ type Config struct {
 	Update    UpdateConfig   `json:"update"`
 	DataDir   string         `json:"dataDir"`
 	Forward   []Rule         `json:"forward,omitempty"` // legacy import and in-memory compatibility view
+	// Access is the in-memory view of the replicated accounts; nil until the
+	// node-local admin below has been migrated into the shared state.
+	Access    *Access        `json:"-"`
 	RulesFile string         `json:"rulesFile"`
 	Node      NodeConfig     `json:"node"`
 	Cluster   *ClusterConfig `json:"cluster,omitempty"`
@@ -46,6 +49,9 @@ type AuthConfig struct {
 	SessionSecret string     `json:"sessionSecret,omitempty"`
 	SessionTTL    int        `json:"sessionTtl"` // seconds
 	Tokens        []APIToken `json:"tokens,omitempty"`
+	// Recovery lets the setup token create or reset an administrator
+	// (set by -reset-auth, cleared once used).
+	Recovery bool `json:"recovery,omitempty"`
 }
 
 type APIToken struct {
@@ -54,6 +60,7 @@ type APIToken struct {
 	Prefix    string    `json:"prefix"`
 	Hash      string    `json:"hash"` // hex sha256 of the full token
 	CreatedAt time.Time `json:"createdAt"`
+	UserID    string    `json:"userId,omitempty"` // set once tokens live in the shared Access
 }
 
 type LogConfig struct {
@@ -162,6 +169,7 @@ func (c *Config) Clone() *Config {
 	if err := json.Unmarshal(b, &out); err != nil {
 		panic(err)
 	}
+	out.Access = c.Access.Clone()
 	return &out
 }
 
@@ -274,7 +282,7 @@ func Open(path string) (*Store, OpenState, error) {
 	if err != nil {
 		return nil, Loaded, fmt.Errorf("open rules: %w", err)
 	}
-	s.cur.Forward = nil
+	s.cur.Forward, s.cur.Access = nil, nil
 	if state != Loaded {
 		if err := s.write(s.cur); err != nil {
 			return nil, Loaded, err
@@ -293,10 +301,23 @@ func (s *Store) Get() *Config {
 	out := *s.cur
 	s.rw.RUnlock()
 	if s.rules != nil {
-		out.Forward = s.rules.Snapshot().Rules
+		snap := s.rules.Snapshot()
+		out.Forward, out.Access = snap.Rules, snap.Access
 	}
 	return &out
 }
+
+// Local returns the node-local config without shared rules or accounts,
+// avoiding a copy of the replicated snapshot. Callers must treat it as read-only.
+func (s *Store) Local() *Config {
+	s.rw.RLock()
+	defer s.rw.RUnlock()
+	out := *s.cur
+	return &out
+}
+
+// Access returns a copy of the replicated accounts, or nil before migration.
+func (s *Store) Access() *Access { return s.rules.Access() }
 
 // Update applies fn to a copy of the config and persists the result. If fn
 // or the write fails, the current config is left unchanged.
@@ -305,7 +326,7 @@ func (s *Store) Update(fn func(c *Config) error) (*Config, error) {
 	defer s.mu.Unlock()
 	previous := s.rules.Snapshot()
 	before := s.Get().Clone()
-	before.Forward = previous.Rules
+	before.Forward, before.Access = previous.Rules, previous.Access
 	next := before.Clone()
 	if err := fn(next); err != nil {
 		return nil, err
@@ -317,15 +338,16 @@ func (s *Store) Update(fn func(c *Config) error) (*Config, error) {
 	if next.RulesFile != before.RulesFile || !reflect.DeepEqual(next.Cluster, before.Cluster) || next.Node.ID != before.Node.ID {
 		return nil, &FieldError{"node.id", "use cluster connection settings for node identity and cluster changes; a restart is required"}
 	}
-	changedRules := !reflect.DeepEqual(before.Forward, next.Forward)
-	rules := next.Forward
+	changedRules := !reflect.DeepEqual(before.Forward, next.Forward) || !reflect.DeepEqual(before.Access, next.Access)
+	rules, access := next.Forward, next.Access
 	before.Forward, next.Forward = nil, nil
+	before.Access, next.Access = nil, nil
 	changedLocal := !reflect.DeepEqual(before, next)
 	if changedRules && changedLocal {
 		return nil, errors.New("update node settings and shared rules separately")
 	}
 	if changedRules {
-		if _, err := s.rules.Update(previous, rules); err != nil {
+		if _, err := s.rules.Update(previous, rules, access); err != nil {
 			return nil, err
 		}
 	}
@@ -367,7 +389,7 @@ func (s *Store) Reload() (old, cur *Config, err error) {
 			return nil, nil, err
 		}
 	}
-	next.Forward = nil
+	next.Forward, next.Access = nil, nil
 	s.rw.Lock()
 	s.cur = next
 	s.rw.Unlock()
@@ -381,7 +403,7 @@ func (s *Store) write(c *Config) error {
 		out.Node.ID = s.connection.NodeID
 		out.Cluster = s.connection.Cluster
 	}
-	out.Forward = nil
+	out.Forward, out.Access = nil, nil
 	if err := out.ValidateNode(); err != nil {
 		return err
 	}

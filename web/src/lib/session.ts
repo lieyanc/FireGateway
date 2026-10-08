@@ -3,15 +3,25 @@ import { toast } from "sonner"
 import { setUnauthorizedListener } from "@/lib/api"
 import { authStateQuery, qk, queryClient } from "@/lib/queries"
 import { statsStore } from "@/lib/stats-store"
-import type { AuthState } from "@/lib/types"
+import type { Account, AuthState } from "@/lib/types"
 
-/** Marks the browser session as signed in (after login or setup). */
-export function signedIn(username: string) {
-  queryClient.setQueryData<AuthState>(qk.authState, {
-    initialized: true,
-    authenticated: true,
-    username,
-  })
+/**
+ * Marks the browser session as signed in (after login, setup or a password
+ * change), then reloads the role and tenant; until they arrive for a new
+ * session the UI treats the user as a member.
+ */
+export function signedIn(account: Account) {
+  queryClient.setQueryData<AuthState>(qk.authState, (prev) =>
+    prev?.userId === account.id
+      ? { ...prev, authenticated: true, username: account.username }
+      : {
+          initialized: true,
+          authenticated: true,
+          userId: account.id,
+          username: account.username,
+        }
+  )
+  void queryClient.invalidateQueries({ queryKey: qk.authState })
 }
 
 /** Forgets everything cached for the signed-out session. */

@@ -52,9 +52,10 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 import { useI18n } from "@/i18n"
 import { api, isApiError } from "@/lib/api"
 import { errorMessage } from "@/lib/errors"
-import { qk } from "@/lib/queries"
+import { qk, useOwnTenant, useSession, useTenants } from "@/lib/queries"
 import type { Rule, RuleView } from "@/lib/types"
 import { cn } from "@/lib/utils"
+import { formatPortRanges } from "@/features/access/utils"
 import {
   emptyRuleForm,
   formToRule,
@@ -72,6 +73,8 @@ export type RuleEditorTarget =
 
 const HOST_PICKS = ["0.0.0.0", "127.0.0.1", "::"]
 const FORM_ID = "rule-form"
+// Radix Select rejects empty item values; stands in for "no owner".
+const NO_OWNER = "__none__"
 
 export function RuleFormDialog({
   target,
@@ -159,6 +162,9 @@ function RuleForm({
 }) {
   const { t } = useI18n()
   const queryClient = useQueryClient()
+  const { isAdmin, isMember } = useSession()
+  const tenants = useTenants(isAdmin)
+  const ownTenant = useOwnTenant(isMember)
   const [formError, setFormError] = React.useState<string | null>(null)
   const schema = React.useMemo(() => makeRuleSchema(t), [t])
 
@@ -245,6 +251,13 @@ function RuleForm({
 
   const invalid = (name: keyof RuleFormValues) => (errors[name] ? true : undefined)
 
+  // Members may only listen inside their tenant's port ranges.
+  const portsHint = ownTenant.data
+    ? ownTenant.data.portRanges.length > 0
+      ? t("rules.form.allowedPorts", { ranges: formatPortRanges(ownTenant.data.portRanges) })
+      : t("rules.form.noPorts")
+    : undefined
+
   return (
     <form
       id={FORM_ID}
@@ -326,6 +339,52 @@ function RuleForm({
                 {...form.register("remark")}
               />
             </Field>
+            {isAdmin && (
+              <Controller
+                control={form.control}
+                name="owner"
+                render={({ field }) => {
+                  const items = tenants.data ?? []
+                  // Keep an owner that isn't listed (yet) selectable.
+                  const missing =
+                    field.value !== "" && !items.some((tn) => tn.id === field.value)
+                  return (
+                    <Field>
+                      <FieldLabel htmlFor="rule-owner">{t("rules.form.owner")}</FieldLabel>
+                      <Select
+                        value={field.value || NO_OWNER}
+                        onValueChange={(v) => field.onChange(v === NO_OWNER ? "" : v)}
+                      >
+                        <SelectTrigger id="rule-owner" className="w-full sm:max-w-80">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectGroup>
+                            <SelectItem value={NO_OWNER}>{t("rules.form.ownerNone")}</SelectItem>
+                            {missing && (
+                              <SelectItem value={field.value}>
+                                <span className="font-mono">{field.value}</span>
+                              </SelectItem>
+                            )}
+                            {items.map((tn) => (
+                              <SelectItem key={tn.id} value={tn.id}>
+                                {tn.name || tn.id}
+                                {tn.name && (
+                                  <span className="font-mono text-muted-foreground">
+                                    {tn.id}
+                                  </span>
+                                )}
+                              </SelectItem>
+                            ))}
+                          </SelectGroup>
+                        </SelectContent>
+                      </Select>
+                      <FieldDescription>{t("rules.form.ownerHint")}</FieldDescription>
+                    </Field>
+                  )
+                }}
+              />
+            )}
           </FieldGroup>
         </FieldSet>
 
@@ -394,6 +453,7 @@ function RuleForm({
                 id="rule-local-port"
                 label={t("rules.form.localPort")}
                 error={errors.localPort?.message}
+                description={portsHint}
                 registration={form.register("localPort", {
                   onChange: () => mirror("localPort", "targetPort"),
                 })}
@@ -404,6 +464,7 @@ function RuleForm({
                 idPrefix="rule-local"
                 startError={errors.localStart?.message}
                 endError={errors.localEnd?.message}
+                description={portsHint}
                 start={form.register("localStart", {
                   onChange: () => {
                     mirror("localStart", "targetStart")
@@ -580,11 +641,13 @@ function PortField({
   id,
   label,
   error,
+  description,
   registration,
 }: {
   id: string
   label: string
   error?: string
+  description?: string
   registration: UseFormRegisterReturn
 }) {
   return (
@@ -599,7 +662,11 @@ function PortField({
         aria-invalid={error ? true : undefined}
         {...registration}
       />
-      {error && <FieldError>{error}</FieldError>}
+      {error ? (
+        <FieldError>{error}</FieldError>
+      ) : (
+        description && <FieldDescription>{description}</FieldDescription>
+      )}
     </Field>
   )
 }

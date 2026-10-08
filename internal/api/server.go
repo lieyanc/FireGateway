@@ -20,6 +20,7 @@ import (
 	"github.com/lieyanc/FireGateway/internal/gateway"
 	"github.com/lieyanc/FireGateway/internal/ha"
 	"github.com/lieyanc/FireGateway/internal/metrics"
+	"github.com/lieyanc/FireGateway/internal/quota"
 	"github.com/lieyanc/FireGateway/internal/updater"
 )
 
@@ -30,6 +31,7 @@ type Deps struct {
 	Sampler *metrics.Sampler
 	Broker  *events.Broker
 	Auth    *auth.Service
+	Quota   *quota.Tracker
 	Updater *updater.Updater
 	Started time.Time
 	// Restart re-execs the process; nil where unsupported.
@@ -69,85 +71,114 @@ func (s *Server) Close() error { return s.srv.Close() }
 
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
+	// h serves everyone who passed withAuth; m serves administrators and
+	// tenant members, scoped to what they own; a serves administrators only.
 	h := func(pattern string, fn http.HandlerFunc) { mux.HandleFunc(pattern, fn) }
+	m := func(pattern string, fn http.HandlerFunc) { mux.HandleFunc(pattern, member(fn)) }
+	a := func(pattern string, fn http.HandlerFunc) { mux.HandleFunc(pattern, admin(fn)) }
 
 	// Public.
 	h("GET /health", s.health)
 	h("GET /ready", s.ready)
 	h("GET /api/version", s.version)
 	h("GET /api/auth/state", s.authState)
-	h("POST /api/auth/setup", s.setup)
 	h("POST /api/auth/login", s.login)
 
 	// Authenticated (enforced by withAuth for everything else under /api).
 	h("POST /api/auth/logout", s.logout)
-	h("POST /api/auth/password", s.changePassword)
 	h("GET /api/auth/tokens", s.listTokens)
-	h("POST /api/auth/tokens", s.createToken)
-	h("DELETE /api/auth/tokens/{id}", s.deleteToken)
+	m("GET /api/tenant", s.ownTenant)
 
-	h("GET /api/overview", s.overview)
-	h("GET /api/cluster", s.clusterStatus)
-	h("GET /api/cluster/config", s.getClusterConnection)
-	h("PUT /api/cluster/config", s.putClusterConnection)
-	h("POST /api/cluster/test-peer", s.testPeerConnection)
-	h("GET /api/cluster/snapshot", s.clusterSnapshot)
-	h("POST /api/cluster/bootstrap", s.clusterBootstrap)
-	h("POST /api/cluster/{action}", s.clusterAction)
-	h("GET /api/cluster/transactions/{id}", s.clusterTransaction)
+	m("GET /api/overview", s.overview)
+	a("GET /api/cluster", s.clusterStatus)
+	a("GET /api/cluster/config", s.getClusterConnection)
+	a("PUT /api/cluster/config", s.putClusterConnection)
+	a("POST /api/cluster/test-peer", s.testPeerConnection)
+	a("GET /api/cluster/snapshot", s.clusterSnapshot)
+	a("POST /api/cluster/bootstrap", s.clusterBootstrap)
+	a("POST /api/cluster/{action}", s.clusterAction)
+	a("GET /api/cluster/transactions/{id}", s.clusterTransaction)
 	if s.Cluster != nil {
 		mux.Handle("/internal/ha/v1", s.Cluster.PeerHandler(s.peerMutation))
 	}
-	h("GET /api/node", s.getNode)
-	h("PUT /api/node", s.putNode)
-	h("POST /api/system/restart", s.restart)
+	a("GET /api/node", s.getNode)
+	a("PUT /api/node", s.putNode)
+	a("POST /api/system/restart", s.restart)
 
-	h("GET /api/rules", s.listRules)
-	h("POST /api/rules", s.createRule)
-	h("GET /api/rules/export", s.exportRules)
-	h("POST /api/rules/import", s.importRules)
-	h("POST /api/rules/import/parse", s.parseImport)
-	h("GET /api/rules/import/rinetd", s.localRinetd)
-	h("POST /api/rules/batch", s.batchRules)
-	h("GET /api/rules/{id}", s.getRule)
-	h("PUT /api/rules/{id}", s.updateRule)
-	h("DELETE /api/rules/{id}", s.deleteRule)
-	h("POST /api/rules/{id}/enable", s.enableRule)
-	h("POST /api/rules/{id}/disable", s.disableRule)
-	h("POST /api/rules/{id}/restart", s.restartRule)
-	h("POST /api/config/reload", s.reloadConfig)
+	m("GET /api/rules", s.listRules)
+	m("GET /api/rules/export", s.exportRules)
+	m("POST /api/rules/import/parse", s.parseImport)
+	a("GET /api/rules/import/rinetd", s.localRinetd)
+	m("GET /api/rules/{id}", s.getRule)
+	m("POST /api/rules/{id}/restart", s.restartRule)
+	a("POST /api/config/reload", s.reloadConfig)
+	s.sharedRoutes(mux)
 
-	h("GET /api/connections", s.listConns)
-	h("DELETE /api/connections", s.closeRuleConns)
-	h("DELETE /api/connections/{id}", s.closeConn)
+	m("GET /api/connections", s.listConns)
+	m("DELETE /api/connections", s.closeRuleConns)
+	m("DELETE /api/connections/{id}", s.closeConn)
 
-	h("GET /api/metrics/realtime", s.metricsRealtime)
-	h("GET /api/metrics/history", s.metricsHistory)
-	h("GET /api/metrics/top", s.metricsTop)
+	m("GET /api/metrics/realtime", s.metricsRealtime)
+	m("GET /api/metrics/history", s.metricsHistory)
+	m("GET /api/metrics/top", s.metricsTop)
 
-	h("GET /api/dns", s.listDNS)
-	h("POST /api/dns/refresh", s.refreshDNS)
+	a("GET /api/dns", s.listDNS)
+	a("POST /api/dns/refresh", s.refreshDNS)
 
-	h("GET /api/events", s.events)
-	h("GET /api/logs", s.logs)
-	h("GET /api/logs/stream", s.logStream)
-	h("GET /api/log-level", s.getLogLevel)
-	h("PUT /api/log-level", s.setLogLevel)
+	m("GET /api/events", s.events)
+	m("GET /api/logs", s.logs)
+	m("GET /api/logs/stream", s.logStream)
+	m("GET /api/log-level", s.getLogLevel)
+	a("PUT /api/log-level", s.setLogLevel)
 
-	h("GET /api/settings", s.getSettings)
-	h("PUT /api/settings", s.putSettings)
+	a("GET /api/settings", s.getSettings)
+	a("PUT /api/settings", s.putSettings)
 
-	h("GET /api/update/status", s.updateStatus)
-	h("POST /api/update/check", s.updateCheck)
-	h("POST /api/update/apply", s.updateApply)
-	h("POST /api/update/dismiss", s.updateDismiss)
+	a("GET /api/update/status", s.updateStatus)
+	a("POST /api/update/check", s.updateCheck)
+	a("POST /api/update/apply", s.updateApply)
+	a("POST /api/update/dismiss", s.updateDismiss)
+
+	a("GET /api/users", s.listUsers)
+	a("GET /api/users/{id}", s.getUser)
+	a("GET /api/tenants", s.listTenants)
+	a("GET /api/tenants/{id}", s.getTenant)
 
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "not_found", "endpoint "+r.Method+" "+r.URL.Path+" not found")
 	})
 	mux.Handle("/", s.static)
 
-	return s.withRecover(s.withHeaders(s.withCORS(s.withAuth(s.withClusterRules(mux)))))
+	return s.withRecover(s.withHeaders(s.withCORS(s.withAuth(s.withClusterWrites(mux)))))
+}
+
+// sharedRoutes registers the writes to replicated state. In a cluster they
+// run on the writer through Execute, so both muxes share this table.
+func (s *Server) sharedRoutes(mux *http.ServeMux) {
+	h := func(pattern string, fn http.HandlerFunc) { mux.HandleFunc(pattern, fn) }
+	m := func(pattern string, fn http.HandlerFunc) { mux.HandleFunc(pattern, member(fn)) }
+	a := func(pattern string, fn http.HandlerFunc) { mux.HandleFunc(pattern, admin(fn)) }
+
+	h("POST /api/auth/setup", s.setup)
+	h("POST /api/auth/password", s.changePassword)
+	h("POST /api/auth/tokens", s.createToken)
+	h("DELETE /api/auth/tokens/{id}", s.deleteToken)
+
+	m("POST /api/rules", s.createRule)
+	m("PUT /api/rules/{id}", s.updateRule)
+	m("DELETE /api/rules/{id}", s.deleteRule)
+	m("POST /api/rules/{id}/enable", s.enableRule)
+	m("POST /api/rules/{id}/disable", s.disableRule)
+	m("POST /api/rules/import", s.importRules)
+	m("POST /api/rules/batch", s.batchRules)
+
+	a("POST /api/users", s.createUser)
+	a("PUT /api/users/{id}", s.updateUser)
+	a("DELETE /api/users/{id}", s.deleteUser)
+	a("POST /api/tenants", s.createTenant)
+	a("PUT /api/tenants/{id}", s.updateTenant)
+	a("DELETE /api/tenants/{id}", s.deleteTenant)
+	a("POST /api/tenants/{id}/usage/reset", s.resetTenantUsage)
 }
 
 var publicPaths = map[string]bool{
@@ -163,19 +194,57 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		_, method := s.Auth.Authenticate(r)
+		p := s.Auth.Authenticate(r)
 		// Browsers attach cookies to cross-site requests; reject those for
 		// state-changing calls. Bearer tokens are not ambient, so exempt.
-		if method != auth.Bearer && unsafeMethod(r.Method) && crossSite(r) {
+		if (p == nil || p.Method != auth.Bearer) && unsafeMethod(r.Method) && crossSite(r) {
 			fail(w, http.StatusForbidden, "forbidden", "cross-site request rejected")
 			return
 		}
-		if method == auth.None && !publicPaths[r.URL.Path] {
+		if p == nil && !publicPaths[r.URL.Path] {
 			fail(w, http.StatusUnauthorized, "unauthorized", "authentication required")
 			return
 		}
+		if p != nil {
+			r = r.WithContext(auth.NewContext(r.Context(), p))
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// admin restricts a handler to administrators.
+func admin(fn http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !auth.FromContext(r.Context()).Admin() {
+			fail(w, http.StatusForbidden, "forbidden", "administrator access required")
+			return
+		}
+		fn(w, r)
+	}
+}
+
+// member admits administrators and tenant members; handlers limit members
+// to their tenant through scopeOf.
+func member(fn http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if p := auth.FromContext(r.Context()); p == nil || (!p.Admin() && p.TenantID == "") {
+			fail(w, http.StatusForbidden, "forbidden", "a tenant or administrator account is required")
+			return
+		}
+		fn(w, r)
+	}
+}
+
+// scopeOf returns the rules the caller may see and manage.
+func scopeOf(r *http.Request) gateway.Scope {
+	p := auth.FromContext(r.Context())
+	if p.Admin() {
+		return gateway.Admin
+	}
+	if p == nil || p.TenantID == "" {
+		return gateway.Scope{Tenant: "@"} // matches no rule
+	}
+	return gateway.Scope{Tenant: p.TenantID}
 }
 
 func unsafeMethod(m string) bool {
@@ -260,6 +329,7 @@ func failErr(w http.ResponseWriter, err error) {
 	var (
 		fe      *config.FieldError
 		ce      *gateway.ConflictError
+		qe      *gateway.QuotaError
 		rl      *auth.RateLimitError
 		pending *ha.PendingError
 	)
@@ -274,6 +344,17 @@ func failErr(w http.ResponseWriter, err error) {
 		fail(w, http.StatusServiceUnavailable, "unavailable", err.Error())
 	case errors.As(err, &ce):
 		fail(w, http.StatusConflict, "conflict", ce.Msg)
+	case errors.As(err, &qe):
+		fail(w, http.StatusConflict, "quota_exceeded", qe.Msg)
+	case errors.Is(err, auth.ErrMigrating):
+		w.Header().Set("Retry-After", "5")
+		fail(w, http.StatusServiceUnavailable, "unavailable", err.Error())
+	case errors.Is(err, auth.ErrSignedOut):
+		fail(w, http.StatusUnauthorized, "unauthorized", err.Error())
+	case errors.Is(err, auth.ErrUserNotFound), errors.Is(err, auth.ErrNoTenant):
+		fail(w, http.StatusNotFound, "not_found", err.Error())
+	case errors.Is(err, auth.ErrLastAdmin), errors.Is(err, auth.ErrSelf), errors.Is(err, auth.ErrTenantInUse):
+		fail(w, http.StatusConflict, "conflict", err.Error())
 	case errors.As(err, &rl):
 		w.Header().Set("Retry-After", strconv.Itoa(int(rl.RetryAfter.Seconds())+1))
 		fail(w, http.StatusTooManyRequests, "rate_limited", rl.Error())

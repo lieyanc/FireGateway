@@ -67,7 +67,7 @@ func TestRulesReplicateThroughAuthenticatedPeerAPI(t *testing.T) {
 		ts.Start()
 		t.Cleanup(func() { ts.Close(); mgr.Stop(); ctrl.Close() })
 		jar, _ := cookiejar.New(nil)
-		return &harness{ts: ts, client: &http.Client{Jar: jar}, auth: authSvc}, ctrl
+		return &harness{ts: ts, client: &http.Client{Jar: jar}, auth: authSvc, srv: s}, ctrl
 	}
 	a, ca := makeNode("a", "b", "127.0.0.1", "127.0.0.2", ta, tb)
 	b, cb := makeNode("b", "a", "127.0.0.2", "127.0.0.1", tb, ta)
@@ -82,13 +82,13 @@ func TestRulesReplicateThroughAuthenticatedPeerAPI(t *testing.T) {
 	if err := cb.SyncStep(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	initial := ca.Status().Checksum
+	initial := b.ruleVersion(t)
 	body := `{"type":"tcp","status":"inactive","localPort":8080,"targetHost":"127.0.0.1","targetPort":3000}`
 	headers := []string{"If-Match", initial, "Idempotency-Key", "create-request-0001"}
 	if code, out := b.do(t, "POST", "/api/rules", body, headers...); code != 201 || out["id"] != "1" {
 		t.Fatalf("standby proxy create: %d %v", code, out)
 	}
-	committed := ca.Status().Checksum
+	committed, version := ca.Status().Checksum, a.ruleVersion(t)
 	if code, out := b.do(t, "POST", "/api/rules", body, headers...); code != 201 || out["id"] != "1" {
 		t.Fatalf("idempotent retry: %d %v", code, out)
 	}
@@ -131,12 +131,52 @@ func TestRulesReplicateThroughAuthenticatedPeerAPI(t *testing.T) {
 		t.Fatal("archive confirmation substituted for fencing confirmation")
 	}
 	// A batch is one replicated publication, including its partial-item report.
-	headers = []string{"If-Match", committed, "Idempotency-Key", "batch-request-0003"}
+	headers = []string{"If-Match", version, "Idempotency-Key", "batch-request-0003"}
 	before := ca.Status().DesiredRevision
 	if code, out := b.do(t, "POST", "/api/rules/batch", `{"action":"delete","ids":["1","missing"]}`, headers...); code != 200 || len(out["ok"].([]any)) != 1 || len(out["failed"].([]any)) != 1 {
 		t.Fatalf("batch: %d %v", code, out)
 	}
 	if ca.Status().DesiredRevision != before+1 {
 		t.Fatal("batch did not publish exactly once")
+	}
+
+	// The writer's local administrator becomes the shared account and keeps
+	// its session; the standby drops its own copy.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	a.srv.MigrateAccounts(ctx)
+	if ca.Snapshot().Access == nil || a.auth.LegacyPending() {
+		t.Fatal("writer did not migrate its administrator")
+	}
+	if err := cb.SyncStep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	b.srv.MigrateAccounts(ctx)
+	if b.srv.Store.Access() == nil || b.auth.LegacyPending() {
+		t.Fatal("standby kept its local administrator")
+	}
+	if code, _ := a.do(t, "GET", "/api/rules", ""); code != 200 {
+		t.Fatalf("migrated session rejected: %d", code)
+	}
+	b = b.login(t, "admin", "password123")
+
+	// Accounts written on the standby replicate and work on the writer.
+	if code, out := b.do(t, "POST", "/api/tenants", `{"id":"team1","name":"Team 1","portRanges":[[20000,20099]]}`); code != 201 {
+		t.Fatalf("standby tenant: %d %v", code, out)
+	}
+	if code, out := b.do(t, "POST", "/api/users", `{"username":"alice","password":"password123","tenantId":"team1"}`); code != 201 {
+		t.Fatalf("standby user: %d %v", code, out)
+	}
+	alice := a.login(t, "alice", "password123")
+	if code, _ := alice.do(t, "POST", "/api/users", `{"username":"eve","password":"password123","role":"admin"}`); code != 403 {
+		t.Fatalf("member created a user through the writer: %d", code)
+	}
+	aliceB := b.login(t, "alice", "password123")
+	headers = []string{"If-Match", aliceB.ruleVersion(t), "Idempotency-Key", "tenant-create-0004"}
+	if code, out := aliceB.do(t, "POST", "/api/rules", tcpRule("20001"), headers...); code != 201 || out["owner"] != "team1" {
+		t.Fatalf("member write through the standby: %d %v", code, out)
+	}
+	if _, out := a.do(t, "GET", "/api/rules", ""); len(out["items"].([]any)) != 1 {
+		t.Fatalf("writer rules: %v", out)
 	}
 }

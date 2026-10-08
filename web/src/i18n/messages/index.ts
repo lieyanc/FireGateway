@@ -1,4 +1,5 @@
 import type { MessagePath } from "@/i18n/define"
+import { access } from "@/i18n/messages/access"
 import { cluster } from "@/i18n/messages/cluster"
 import { connection } from "@/i18n/messages/connection"
 import { auth } from "@/i18n/messages/auth"
@@ -11,6 +12,7 @@ import { settings } from "@/i18n/messages/settings"
 import { traffic } from "@/i18n/messages/traffic"
 
 const namespaces = {
+  access,
   cluster,
   connection,
   common,

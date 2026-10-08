@@ -382,6 +382,14 @@ function ConfigCard({ rule }: { rule: RuleView }) {
               ? t("rules.detail.config.perDirection", { rate: fmt.rate(limits.bandwidth) })
               : unlimited}
           </ConfigRow>
+          {rule.owner && (
+            <>
+              <Separator />
+              <ConfigRow label={t("rules.detail.config.owner")}>
+                <span className="font-mono">{rule.owner}</span>
+              </ConfigRow>
+            </>
+          )}
           {rule.remark && (
             <>
               <Separator />

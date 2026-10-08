@@ -24,13 +24,19 @@ type RuleSet struct {
 	ParentChecksum string `json:"parentChecksum,omitempty"`
 	Checksum       string `json:"checksum"`
 	Rules          []Rule `json:"rules"`
+	// Access is omitted until accounts are migrated, so older snapshots keep
+	// their checksums.
+	Access *Access `json:"access,omitempty"`
 }
 
-func NewRuleSet(clusterID string, revision int64, rules []Rule) RuleSet {
+// MaxSnapshotSize bounds a publication, including accounts.
+const MaxSnapshotSize = 1 << 20
+
+func NewRuleSet(clusterID string, revision int64, rules []Rule, access *Access) RuleSet {
 	if rules == nil {
 		rules = []Rule{}
 	}
-	s := RuleSet{SchemaVersion: 1, ClusterID: clusterID, Revision: revision, Rules: rules}
+	s := RuleSet{SchemaVersion: 1, ClusterID: clusterID, Revision: revision, Rules: rules, Access: access.Clone()}
 	s.Checksum = s.digest()
 	return s
 }
@@ -43,8 +49,8 @@ func (s RuleSet) digest() string {
 }
 
 func (s RuleSet) Verify() error {
-	if b, _ := json.Marshal(s); len(b) > 256<<10 {
-		return errors.New("rule snapshot exceeds the 256 KiB limit")
+	if b, _ := json.Marshal(s); len(b) > MaxSnapshotSize {
+		return errors.New("rule snapshot exceeds the 1 MiB limit")
 	}
 	if (s.SchemaVersion != 1 && s.SchemaVersion != 2) || s.Revision < 1 || s.Rules == nil {
 		return errors.New("invalid rule snapshot version or rules")
@@ -64,8 +70,22 @@ func (s RuleSet) Verify() error {
 			return fmt.Errorf("duplicate rule id %s", r.ID)
 		}
 		seen[r.ID] = true
+		if r.Owner != "" && s.Access == nil {
+			return fmt.Errorf("rule %s has an owner but no tenants are defined", r.ID)
+		}
+	}
+	if s.Access != nil {
+		if err := s.Access.Validate(s.Rules); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func sameRules(a, b []Rule) bool {
+	x, _ := json.Marshal(NewRuleSet("", 1, a, nil).Rules)
+	y, _ := json.Marshal(NewRuleSet("", 1, b, nil).Rules)
+	return string(x) == string(y)
 }
 
 // RuleBackend provides the single authoritative compare-and-swap operation.
@@ -87,7 +107,7 @@ func openRules(path string, legacy []Rule, clusterID string) (*RuleStore, error)
 	s := &RuleStore{path: path, clustered: clusterID != ""}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		s.cur = NewRuleSet(clusterID, 1, legacy)
+		s.cur = NewRuleSet(clusterID, 1, legacy, nil)
 		if err := s.cur.Verify(); err != nil {
 			return nil, err
 		}
@@ -112,11 +132,11 @@ func openRules(path string, legacy []Rule, clusterID string) (*RuleStore, error)
 		if _, err := os.Stat(path + ".ha.json"); !errors.Is(err, os.ErrNotExist) {
 			return nil, errors.New("cannot adopt standalone rules with an existing or inaccessible HA checkpoint")
 		}
-		next := NewRuleSet(clusterID, s.cur.Revision, s.cur.Rules)
+		next := NewRuleSet(clusterID, s.cur.Revision, s.cur.Rules, s.cur.Access)
 		if err := next.Verify(); err != nil {
 			return nil, err
 		}
-		if len(legacy) > 0 && NewRuleSet(clusterID, next.Revision, legacy).Checksum != next.Checksum {
+		if len(legacy) > 0 && !sameRules(legacy, next.Rules) {
 			return nil, errors.New("inline rules conflict with the standalone snapshot")
 		}
 		if err := writeJSONFile(path, next); err != nil {
@@ -124,7 +144,7 @@ func openRules(path string, legacy []Rule, clusterID string) (*RuleStore, error)
 		}
 		s.cur = next
 	}
-	if len(legacy) > 0 && NewRuleSet(clusterID, s.cur.Revision, legacy).Checksum != s.cur.Checksum {
+	if len(legacy) > 0 && !sameRules(legacy, s.cur.Rules) {
 		return nil, errors.New("both inline forward and rulesFile contain different rules; resolve the conflict before migration")
 	}
 	return s, nil
@@ -139,16 +159,22 @@ func (s *RuleStore) Snapshot() RuleSet {
 	_ = json.Unmarshal(b, &out)
 	return out
 }
+// Access returns a copy of the replicated accounts, or nil before migration.
+func (s *RuleStore) Access() *Access {
+	s.rw.RLock()
+	defer s.rw.RUnlock()
+	return s.cur.Access.Clone()
+}
 func (s *RuleStore) SetBackend(b RuleBackend) { s.mu.Lock(); defer s.mu.Unlock(); s.backend = b }
 
-func (s *RuleStore) Update(previous RuleSet, rules []Rule) (RuleSet, error) {
+func (s *RuleStore) Update(previous RuleSet, rules []Rule, access *Access) (RuleSet, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur := s.Snapshot()
 	if previous.Checksum != cur.Checksum {
 		return cur, ErrRevisionConflict
 	}
-	next := NewRuleSet(cur.ClusterID, cur.Revision+1, rules)
+	next := NewRuleSet(cur.ClusterID, cur.Revision+1, rules, access)
 	if err := next.Verify(); err != nil {
 		return cur, err
 	}
@@ -251,13 +277,14 @@ func writeJSONFile(path string, value any) error {
 	return nil
 }
 
-// WithWriter constructs a publication under an explicitly authorized writer.
-func WithWriter(previous RuleSet, epoch int64, writer string, rules []Rule) RuleSet {
+// WithWriter constructs a publication of content's rules and accounts under
+// an explicitly authorized writer.
+func WithWriter(previous RuleSet, epoch int64, writer string, content RuleSet) RuleSet {
 	rev := previous.Revision + 1
 	if previous.WriterEpoch != epoch {
 		rev = 1
 	}
-	s := NewRuleSet(previous.ClusterID, rev, rules)
+	s := NewRuleSet(previous.ClusterID, rev, content.Rules, content.Access)
 	s.SchemaVersion = 2
 	s.WriterEpoch = epoch
 	s.WriterID = writer

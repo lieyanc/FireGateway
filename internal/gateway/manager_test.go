@@ -38,7 +38,7 @@ func tcpRule(port int) config.Rule {
 
 func TestCreateUpdateDelete(t *testing.T) {
 	m, store := newManager(t)
-	r, err := m.Create(tcpRule(freePort(t)))
+	r, err := m.Create(Admin, tcpRule(freePort(t)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestCreateUpdateDelete(t *testing.T) {
 	// Policy-only change keeps the same runner (no re-bind).
 	r.Name = "renamed"
 	r.Limits = &config.Limits{MaxConnections: 5}
-	if _, err := m.Update(r.ID, r); err != nil {
+	if _, err := m.Update(Admin, r.ID, r); err != nil {
 		t.Fatal(err)
 	}
 	if m.Runner(r.ID) != rn || rn.Name() != "renamed" {
@@ -62,26 +62,26 @@ func TestCreateUpdateDelete(t *testing.T) {
 
 	// Changing the listen port re-binds.
 	r.LocalPort = freePort(t)
-	if _, err := m.Update(r.ID, r); err != nil {
+	if _, err := m.Update(Admin, r.ID, r); err != nil {
 		t.Fatal(err)
 	}
 	if m.Runner(r.ID) == rn {
 		t.Fatal("port change should restart the runner")
 	}
 
-	if _, err := m.SetActive(r.ID, false); err != nil {
+	if _, err := m.SetActive(Admin, r.ID, false); err != nil {
 		t.Fatal(err)
 	}
 	if m.Runner(r.ID) != nil {
 		t.Fatal("disabled rule still running")
 	}
-	if err := m.Delete(r.ID); err != nil {
+	if err := m.Delete(Admin, r.ID); err != nil {
 		t.Fatal(err)
 	}
 	if len(store.Get().Forward) != 0 {
 		t.Fatal("rule not removed from config")
 	}
-	if err := m.Delete(r.ID); !errors.Is(err, ErrNotFound) {
+	if err := m.Delete(Admin, r.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
 }
@@ -89,35 +89,35 @@ func TestCreateUpdateDelete(t *testing.T) {
 func TestConflicts(t *testing.T) {
 	m, _ := newManager(t)
 	p := freePort(t)
-	if _, err := m.Create(tcpRule(p)); err != nil {
+	if _, err := m.Create(Admin, tcpRule(p)); err != nil {
 		t.Fatal(err)
 	}
 	var ce *ConflictError
 	dup := tcpRule(p)
 	dup.LocalHost = "0.0.0.0"
-	if _, err := m.Create(dup); !errors.As(err, &ce) {
+	if _, err := m.Create(Admin, dup); !errors.As(err, &ce) {
 		t.Fatalf("expected listen conflict, got %v", err)
 	}
 	// An inactive rule may share the address.
 	dup.Status = config.StatusInactive
-	if _, err := m.Create(dup); err != nil {
+	if _, err := m.Create(Admin, dup); err != nil {
 		t.Fatalf("inactive duplicate rejected: %v", err)
 	}
 	withID := tcpRule(freePort(t))
 	withID.ID = "1"
-	if _, err := m.Create(withID); !errors.As(err, &ce) {
+	if _, err := m.Create(Admin, withID); !errors.As(err, &ce) {
 		t.Fatalf("expected duplicate id conflict, got %v", err)
 	}
 	var fe *config.FieldError
-	if _, err := m.Create(config.Rule{Type: "tcp"}); !errors.As(err, &fe) {
+	if _, err := m.Create(Admin, config.Rule{Type: "tcp"}); !errors.As(err, &fe) {
 		t.Fatalf("expected validation error, got %v", err)
 	}
 }
 
 func TestImportAndBatch(t *testing.T) {
 	m, store := newManager(t)
-	a, _ := m.Create(tcpRule(freePort(t)))
-	res, err := m.Import([]config.Rule{tcpRule(freePort(t)), {ID: a.ID, Type: "udp", LocalHost: "127.0.0.1",
+	a, _ := m.Create(Admin, tcpRule(freePort(t)))
+	res, err := m.Import(Admin, []config.Rule{tcpRule(freePort(t)), {ID: a.ID, Type: "udp", LocalHost: "127.0.0.1",
 		LocalPort: freePort(t), TargetHost: "127.0.0.1", TargetPort: 9}}, false)
 	if err != nil {
 		t.Fatal(err)
@@ -131,14 +131,14 @@ func TestImportAndBatch(t *testing.T) {
 
 	// A bad rule aborts the whole import.
 	var fe *config.FieldError
-	if _, err := m.Import([]config.Rule{{Type: "bogus"}}, true); !errors.As(err, &fe) || fe.Field != "forward[0].type" {
+	if _, err := m.Import(Admin, []config.Rule{{Type: "bogus"}}, true); !errors.As(err, &fe) || fe.Field != "forward[0].type" {
 		t.Fatalf("expected indexed validation error, got %v", err)
 	}
 	if len(store.Get().Forward) != 2 {
 		t.Fatal("failed import modified config")
 	}
 
-	br, err := m.Batch("disable", []config.RuleID{"1", "2", "missing"})
+	br, err := m.Batch(Admin, "disable", []config.RuleID{"1", "2", "missing"})
 	if err != nil || len(br.OK) != 2 || len(br.Failed) != 1 {
 		t.Fatalf("batch: %+v %v", br, err)
 	}
@@ -146,8 +146,54 @@ func TestImportAndBatch(t *testing.T) {
 		t.Fatal("batch disable left runners")
 	}
 
-	res, err = m.Import(nil, true)
+	res, err = m.Import(Admin, nil, true)
 	if err != nil || res.Removed != 2 || len(store.Get().Forward) != 0 {
 		t.Fatalf("replace with empty: %+v %v", res, err)
+	}
+}
+
+func TestTenantScopeAndSuspension(t *testing.T) {
+	m, store := newManager(t)
+	lo := freePort(t)
+	_, err := store.Update(func(c *config.Config) error {
+		c.Access = &config.Access{SessionSecret: "0123456789abcdef0123", Users: []config.User{}, Tokens: []config.APIToken{},
+			Tenants: []config.Tenant{{ID: "team1", Name: "Team 1", PortRanges: []config.PortRange{{lo, lo}}}}}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	team := Scope{Tenant: "team1"}
+	r, err := m.Create(team, tcpRule(lo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Owner != "team1" {
+		t.Fatalf("owner not forced: %q", r.Owner)
+	}
+	other, err := m.Create(Admin, tcpRule(freePort(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.SetActive(Scope{Tenant: "team2"}, r.ID, false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign tenant changed a rule: %v", err)
+	}
+	if _, err := m.Batch(team, "disable", []config.RuleID{other.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if m.Runner(other.ID) == nil {
+		t.Fatal("tenant batch reached a foreign rule")
+	}
+
+	m.SetSuspended(map[string]bool{"team1": true})
+	if m.Runner(r.ID) != nil || m.Runtime(&r).State != StateSuspended {
+		t.Fatalf("suspended tenant still running: %+v", m.Runtime(&r))
+	}
+	if m.Runner(other.ID) == nil {
+		t.Fatal("suspension stopped another owner's rule")
+	}
+	m.SetSuspended(map[string]bool{})
+	if m.Runner(r.ID) == nil {
+		t.Fatal("rule did not resume after the quota cleared")
 	}
 }

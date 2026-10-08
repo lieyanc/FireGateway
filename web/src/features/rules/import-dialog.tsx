@@ -52,7 +52,7 @@ import { formatListen, formatTarget } from "@/features/rules/utils"
 import { useI18n } from "@/i18n"
 import { api } from "@/lib/api"
 import { errorMessage } from "@/lib/errors"
-import { qk, useRules } from "@/lib/queries"
+import { qk, useRules, useSession } from "@/lib/queries"
 import type {
   ImportFormat,
   ImportMode,
@@ -80,6 +80,9 @@ export function ImportRulesDialog({
   const queryClient = useQueryClient()
   const { data: existing } = useRules()
   const [tab, setTab] = React.useState<Source>("file")
+  // Reading this node's rinetd config is reserved for administrators.
+  const { isAdmin } = useSession()
+  const sources = isAdmin ? SOURCES : SOURCES.filter((s) => s !== "rinetd")
   const [text, setText] = React.useState("")
   const [format, setFormat] = React.useState<ImportFormat>("auto")
   const [loaded, setLoaded] = React.useState<Loaded | null>(null)
@@ -215,7 +218,7 @@ export function ImportRulesDialog({
               className="gap-4"
             >
               <TabsList>
-                {SOURCES.map((s) => (
+                {sources.map((s) => (
                   <TabsTrigger key={s} value={s} disabled={pending}>
                     {t(`rules.import.tabs.${s}`)}
                   </TabsTrigger>

@@ -1,4 +1,10 @@
-import { CircleAlertIcon, CircleCheckIcon, CircleMinusIcon, TriangleAlertIcon } from "lucide-react"
+import {
+  CircleAlertIcon,
+  CircleCheckIcon,
+  CircleMinusIcon,
+  CirclePauseIcon,
+  TriangleAlertIcon,
+} from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { useI18n } from "@/i18n"
@@ -9,6 +15,7 @@ const STATE_VARIANT = {
   partial: "warning",
   error: "destructive",
   stopped: "secondary",
+  suspended: "warning",
 } as const
 
 const STATE_ICON = {
@@ -16,6 +23,7 @@ const STATE_ICON = {
   partial: TriangleAlertIcon,
   error: CircleAlertIcon,
   stopped: CircleMinusIcon,
+  suspended: CirclePauseIcon,
 }
 
 /** Rule runtime state; always icon + label so it never relies on color. */

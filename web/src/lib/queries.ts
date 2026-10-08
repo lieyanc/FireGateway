@@ -41,6 +41,9 @@ export const qk = {
   dns: ["dns"] as const,
   settings: ["settings"] as const,
   updateStatus: ["update", "status"] as const,
+  users: ["users"] as const,
+  tenants: ["tenants"] as const,
+  ownTenant: ["tenant"] as const,
 }
 
 export const authStateQuery = queryOptions({
@@ -52,6 +55,18 @@ export const authStateQuery = queryOptions({
 
 export function useAuthState() {
   return useQuery(authStateQuery)
+}
+
+/** The signed-in user's role; members only see their tenant's resources. */
+export function useSession() {
+  const { data } = useAuthState()
+  return {
+    isAdmin: data?.role === "admin",
+    // Both are false until the role is known, e.g. right after signing in.
+    isMember: data?.role === "member",
+    tenantId: data?.tenantId,
+    tenantName: data?.tenantName,
+  }
 }
 
 export function useVersion() {
@@ -148,5 +163,30 @@ export function useTokens() {
   return useQuery({
     queryKey: qk.tokens,
     queryFn: async () => (await api.auth.tokens()).items,
+  })
+}
+
+export function useUsers() {
+  return useQuery({
+    queryKey: qk.users,
+    queryFn: async () => (await api.users.list()).items,
+  })
+}
+
+export function useTenants(enabled = true) {
+  return useQuery({
+    queryKey: qk.tenants,
+    queryFn: async () => (await api.tenants.list()).items,
+    enabled,
+    refetchInterval: enabled ? 30_000 : false,
+  })
+}
+
+export function useOwnTenant(enabled = true) {
+  return useQuery({
+    queryKey: qk.ownTenant,
+    queryFn: api.tenants.own,
+    enabled,
+    refetchInterval: enabled ? 30_000 : false,
   })
 }

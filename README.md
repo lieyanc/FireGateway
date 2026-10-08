@@ -14,7 +14,11 @@ OpenWrt DMZ failover and per-node local IP/service overrides are described in [t
 - **Access control & limits** per rule: IP/CIDR allow- or deny-list, max concurrent connections (total and per source IP), bandwidth limit per direction.
 - **Live monitoring**: per-rule counters and rates pushed over Server-Sent Events every second, live connection list with the ability to close connections, traffic history (1h / 24h / 7d / 30d) persisted across restarts.
 - **Web UI** (React + shadcn/ui, embedded in the binary): dashboard, rules, connections, traffic, live logs, settings; English and Chinese; light/dark theme.
-- **Security**: single admin account (bcrypt), signed HttpOnly session cookie, API tokens for scripts, login throttling, CSRF checks.
+- **Multi-tenant**:
+  - Administrators create tenants with their own local port ranges, rule limits and monthly traffic quota.
+  - Tenant members see and manage only their tenant's rules, connections, traffic and logs.
+  - A tenant over its traffic quota is suspended until the next period.
+- **Security**: bcrypt user accounts with admin/member roles, signed HttpOnly session cookies, per-user API tokens for scripts, login throttling, CSRF checks. In a cluster, both nodes share the same accounts.
 - **Self-update** from GitHub Releases (opt-in), verified against `SHA256SUMS`.
 
 ## Quick start
@@ -33,11 +37,20 @@ Open `http://127.0.0.1:8080`. On first start no admin account exists; the log pr
 level=WARN msg="admin account not set up yet: open the web UI and enter this setup token" url=http://127.0.0.1:8080 setupToken=Xy12...
 ```
 
-Enter it in the UI together with a username and password. Forgot the password? Stop the service, run `firegateway -c <config> -reset-auth`, start again and repeat setup.
+Enter it in the UI together with a username and password to create the first administrator. Then add tenants and their members under *Users & tenants* in the UI.
+
+Lost every administrator password? Recover access like this:
+
+1. Stop the service.
+2. Run `firegateway -c <config> -reset-auth`.
+3. Start the service again. It logs a recovery setup token.
+4. Enter the token in the UI with a username and password. If that account exists, its password is reset and it is made an administrator. Otherwise a new administrator is created.
+
+Other accounts, tenants and rules are kept.
 
 The UI listens on `127.0.0.1` by default. To reach it remotely, put it behind a TLS reverse proxy (recommended) or set `api.host` to `0.0.0.0`.
 
-Flags: `-c <path>` config file, `-v` print version, `-reset-auth` remove the admin account and API tokens. Signals: `SIGINT`/`SIGTERM` graceful shutdown, `SIGHUP` reload node settings and the standalone rules snapshot.
+Flags: `-c <path>` config file, `-v` print version, `-reset-auth` enable one-time administrator recovery on the next start. Signals: `SIGINT`/`SIGTERM` graceful shutdown, `SIGHUP` reload node settings and the standalone rules snapshot.
 
 ### systemd
 
@@ -86,8 +99,8 @@ Other sections (missing fields are filled in from the template on start):
 | `api` | `enabled` (default true), `host` (`127.0.0.1`), `port` (`8080`), `enableCors` (false; only API tokens work cross-origin) |
 | `logging` | `level` (`error`/`warn`/`info`/`debug`/`trace`), `enableConsole`, `enableFile`, `logDir`, `maxFileSize`, `maxFiles`. Per-connection events are logged at `debug` |
 | `update` | `enabled` (false), `channel` (`stable`/`dev`), `checkInterval` (seconds), `source` (`github`/`proxy`), `proxyBaseUrl`, `repo` |
-| `dataDir` | Traffic history and downloaded updates (`./data`) |
-| `auth` | Managed by the UI: admin username, bcrypt hash, session secret, API token hashes |
+| `dataDir` | Traffic history, per-tenant traffic usage (`tenant-usage.json`) and downloaded updates (`./data`) |
+| `auth` | Node-local recovery flag; credentials from single-admin releases are migrated into the shared accounts on start |
 
 Environment variables `API_HOST`, `API_PORT` and `LOG_LEVEL` take precedence over the template for fields that are missing when the file is created or completed.
 
@@ -130,7 +143,8 @@ internal/proxy      TCP/UDP forwarding engine (splice, ACL, limits, connection t
 internal/dnscache   background-refreshed resolution of hostname targets
 internal/gateway    rule lifecycle and hot reconciliation
 internal/metrics    1s sampler, realtime/minute/hour series, persistence
-internal/auth       admin login, sessions, API tokens
+internal/auth       users, tenants, sessions, API tokens, account recovery
+internal/quota      per-tenant traffic accounting and quota suspension
 internal/api        REST + SSE handlers, embedded UI serving
 internal/logx       logging, file rotation, in-memory log ring
 internal/updater    self-update from GitHub Releases

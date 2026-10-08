@@ -8,7 +8,8 @@ import { installUnauthorizedHandler, PUBLIC_PATHS, safeNext } from "@/lib/sessio
 
 /**
  * Root route: routes the user to /setup, /login or the app depending on the
- * server's auth state.
+ * server's auth state. /setup is open before the first account exists and,
+ * for signed-out users, while account recovery is available.
  */
 export function AuthGate() {
   const { t } = useI18n()
@@ -42,7 +43,11 @@ export function AuthGate() {
     return path === "/setup" ? <Page /> : <Navigate to="/setup" replace />
   }
   if (!state.authenticated) {
-    if (path === "/login") return <Page />
+    // While account recovery is armed (-reset-auth), /setup stays reachable
+    // alongside the normal sign-in page.
+    if (path === "/login" || (path === "/setup" && state.setupAvailable)) {
+      return <Page />
+    }
     const next = path === "/" || path === "/setup" ? "" : path + location.search
     return (
       <Navigate

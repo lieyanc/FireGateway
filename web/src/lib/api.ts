@@ -5,6 +5,7 @@ import type {
   ClusterStatus,
   ClusterConnectionInfo,
   ClusterConnectionInput,
+  Account,
   ApiToken,
   AuthState,
   BatchAction,
@@ -25,9 +26,13 @@ import type {
   RuleView,
   Settings,
   SettingsUpdateResult,
+  Tenant,
+  TenantInput,
   TopItem,
   UpdateCheckResult,
   UpdateStatus,
+  User,
+  UserInput,
   VersionInfo,
 } from "@/lib/types"
 
@@ -111,6 +116,25 @@ function sharedRuleMutation(method: string, path: string) {
   )
 }
 
+/** Writes to state the cluster replicates; each carries an Idempotency-Key. */
+function replicatedWrite(method: string, path: string) {
+  return (
+    sharedRuleMutation(method, path) ||
+    (method !== "GET" &&
+      (path === "/api/auth/setup" ||
+        path === "/api/auth/password" ||
+        path.startsWith("/api/auth/tokens") ||
+        path.startsWith("/api/users") ||
+        path.startsWith("/api/tenants")))
+  )
+}
+
+function newRequestId() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(24)), (v) =>
+    v.toString(16).padStart(2, "0")
+  ).join("")
+}
+
 export async function request<T>(
   method: string,
   path: string,
@@ -133,11 +157,9 @@ export async function request<T>(
       await snapshot.text()
     }
     if (ruleVersion) headers["If-Match"] = ruleVersion
-    headers["Idempotency-Key"] =
-      options.requestId ??
-      Array.from(crypto.getRandomValues(new Uint8Array(24)), (v) =>
-        v.toString(16).padStart(2, "0")
-      ).join("")
+  }
+  if (replicatedWrite(method, path)) {
+    headers["Idempotency-Key"] = options.requestId ?? newRequestId()
   }
   const init: RequestInit = {
     method,
@@ -209,19 +231,37 @@ export const api = {
   auth: {
     state: () => get<AuthState>("/api/auth/state"),
     setup: (body: { setupToken: string; username: string; password: string }) =>
-      post<{ username: string }>("/api/auth/setup", body),
+      post<Account>("/api/auth/setup", body),
     login: (body: { username: string; password: string }) =>
-      post<{ username: string }>("/api/auth/login", body),
+      post<Account>("/api/auth/login", body),
     logout: () => post<void>("/api/auth/logout"),
     changePassword: (body: {
       currentPassword: string
       newPassword: string
       username?: string
-    }) => post<{ username: string }>("/api/auth/password", body),
+    }) => post<Account>("/api/auth/password", body),
     tokens: () => get<{ items: ApiToken[] }>("/api/auth/tokens"),
     createToken: (name: string) =>
       post<{ token: string; item: ApiToken }>("/api/auth/tokens", { name }),
     revokeToken: (id: string) => del<void>(`/api/auth/tokens/${enc(id)}`),
+  },
+  users: {
+    list: () => get<{ items: User[] }>("/api/users"),
+    create: (body: UserInput) => post<User>("/api/users", body),
+    update: (id: string, body: UserInput) =>
+      put<User>(`/api/users/${enc(id)}`, body),
+    remove: (id: string) => del<void>(`/api/users/${enc(id)}`),
+  },
+  tenants: {
+    list: () => get<{ items: Tenant[] }>("/api/tenants"),
+    /** The caller's own tenant (members only). */
+    own: () => get<Tenant>("/api/tenant"),
+    create: (body: TenantInput) => post<Tenant>("/api/tenants", body),
+    update: (id: string, body: Omit<TenantInput, "id">) =>
+      put<Tenant>(`/api/tenants/${enc(id)}`, body),
+    remove: (id: string) => del<void>(`/api/tenants/${enc(id)}`),
+    resetUsage: (id: string) =>
+      post<Tenant>(`/api/tenants/${enc(id)}/usage/reset`),
   },
   system: {
     version: () => get<VersionInfo>("/api/version"),

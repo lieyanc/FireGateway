@@ -151,7 +151,7 @@ func TestCancelPendingConnectionAndFailedSave(t *testing.T) {
 
 func TestStandaloneAdoptionRejectsExistingCheckpointAndCluster(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rules.json")
-	if err := writeJSONFile(path, NewRuleSet("", 1, nil)); err != nil {
+	if err := writeJSONFile(path, NewRuleSet("", 1, nil, nil)); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(path+".ha.json", []byte("existing"), 0600); err != nil {
@@ -160,7 +160,7 @@ func TestStandaloneAdoptionRejectsExistingCheckpointAndCluster(t *testing.T) {
 	if _, err := openRules(path, nil, "dmz"); err == nil {
 		t.Fatal("adopted rules over an existing checkpoint")
 	}
-	if err := writeJSONFile(path, NewRuleSet("old-cluster", 1, nil)); err != nil {
+	if err := writeJSONFile(path, NewRuleSet("old-cluster", 1, nil, nil)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := openRules(path, nil, "new-cluster"); err == nil {

@@ -64,7 +64,7 @@ func (m *Manager) Activate(until time.Time, expected ...string) bool {
 	}
 	if len(expected) > 0 {
 		for _, rule := range m.List() {
-			if rule.Active() {
+			if m.runnable(&rule) {
 				rn := m.Runner(rule.ID)
 				if rn == nil || rn.Listeners() == 0 || len(rn.Failures()) > 0 {
 					return false
@@ -130,7 +130,7 @@ func (m *Manager) Prepare() error {
 	m.prepared = true
 	for i := range rules {
 		r := &rules[i]
-		if !r.Active() {
+		if !m.runnable(r) {
 			continue
 		}
 		if m.Runner(r.ID) == nil {
@@ -224,7 +224,7 @@ func (m *Manager) UpdateNode(node config.NodeConfig) error {
 			continue
 		}
 		m.stop(r.ID)
-		if r.Active() {
+		if m.runnable(&r) {
 			m.start(&r)
 		}
 	}

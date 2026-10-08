@@ -9,8 +9,9 @@ import (
 )
 
 type Event struct {
-	Name string
-	Data []byte // JSON
+	Name  string
+	Data  []byte // JSON
+	Value any    // the published value, for subscribers that filter it
 }
 
 type Broker struct {
@@ -31,7 +32,7 @@ func (b *Broker) Publish(name string, v any) {
 		slog.Error("encode event", "event", name, "err", err)
 		return
 	}
-	e := Event{name, data}
+	e := Event{name, data, v}
 	for ch := range b.subs {
 		select {
 		case ch <- e:

@@ -15,6 +15,7 @@ export const auth = defineMessages({
       invalid: "Incorrect username or password.",
       rateLimited: "Too many failed attempts. Try again in {seconds}s.",
       rateLimitedNoWait: "Too many failed attempts. Try again later.",
+      recover: "Recover with a setup token",
     },
     setup: {
       title: "Welcome to FireGateway",
@@ -28,6 +29,12 @@ export const auth = defineMessages({
       submit: "Create account",
       submitting: "Creating…",
       success: "Administrator account created",
+      recoveryTitle: "Recover administrator access",
+      recoveryDescription:
+        "Account recovery is enabled on this node. Enter the setup token from the server log to create an administrator, or to reset the password of an existing account and make it an administrator.",
+      recoverySubmit: "Recover access",
+      recoverySuccess: "Administrator access restored",
+      backToLogin: "Back to sign in",
     },
     validation: {
       usernameRequired: "Enter a username",
@@ -51,6 +58,7 @@ export const auth = defineMessages({
       invalid: "用户名或密码错误。",
       rateLimited: "失败次数过多，请在 {seconds} 秒后重试。",
       rateLimitedNoWait: "失败次数过多，请稍后再试。",
+      recover: "使用初始化令牌恢复访问",
     },
     setup: {
       title: "欢迎使用 FireGateway",
@@ -64,6 +72,12 @@ export const auth = defineMessages({
       submit: "创建账户",
       submitting: "创建中…",
       success: "管理员账户已创建",
+      recoveryTitle: "恢复管理员访问",
+      recoveryDescription:
+        "本节点已开启账户恢复。输入服务端日志中的初始化令牌，可新建管理员；若用户名已存在，则重置其密码并设为管理员。",
+      recoverySubmit: "恢复访问",
+      recoverySuccess: "管理员访问已恢复",
+      backToLogin: "返回登录",
     },
     validation: {
       usernameRequired: "请输入用户名",

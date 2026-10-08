@@ -81,7 +81,7 @@ export function AccountTab() {
         newPassword: values.newPassword,
         username: values.username !== currentUsername ? values.username : undefined,
       })
-      signedIn(res.username)
+      signedIn(res)
       form.reset({
         currentPassword: "",
         username: res.username,

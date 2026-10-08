@@ -58,14 +58,14 @@ func TestRuleSnapshotConflictsAndCorruption(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := s.Rules().Snapshot()
-	next := NewRuleSet("", 2, []Rule{{ID: "web", Type: "tcp", Status: "active", LocalHost: "127.0.0.1", LocalPort: 8000, TargetHost: "127.0.0.1", TargetPort: 9000}})
+	next := NewRuleSet("", 2, []Rule{{ID: "web", Type: "tcp", Status: "active", LocalHost: "127.0.0.1", LocalPort: 8000, TargetHost: "127.0.0.1", TargetPort: 9000}}, nil)
 	if err := s.Rules().Install(next); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Rules().Install(first); err != ErrRevisionConflict {
 		t.Fatalf("stale snapshot: %v", err)
 	}
-	if _, err := s.Rules().Update(first, nil); err != ErrRevisionConflict {
+	if _, err := s.Rules().Update(first, nil, nil); err != ErrRevisionConflict {
 		t.Fatalf("stale write: %v", err)
 	}
 	next.Rules[0].TargetPort = 9999

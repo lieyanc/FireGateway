@@ -17,13 +17,15 @@ import {
 } from "@/components/ui/sidebar"
 import { isNavActive, NAV_ITEMS } from "@/components/layout/nav"
 import { useI18n } from "@/i18n"
-import { useVersion } from "@/lib/queries"
+import { useSession, useVersion } from "@/lib/queries"
 
 export function AppSidebar() {
   const { t } = useI18n()
   const { pathname } = useLocation()
   const { isMobile, setOpenMobile } = useSidebar()
   const version = useVersion()
+  const { isAdmin } = useSession()
+  const items = NAV_ITEMS.filter((item) => isAdmin || !item.admin)
 
   const closeOnMobile = () => {
     if (isMobile) setOpenMobile(false)
@@ -57,7 +59,7 @@ export function AppSidebar() {
           <SidebarGroupLabel>{t("shell.nav.main")}</SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
-              {NAV_ITEMS.map((item) => {
+              {items.map((item) => {
                 const label = t(item.label)
                 return (
                   <SidebarMenuItem key={item.to}>
