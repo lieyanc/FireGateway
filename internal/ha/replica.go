@@ -16,7 +16,7 @@ import (
 	"github.com/lieyanc/FireGateway/internal/config"
 )
 
-var ErrFrozen = fmt.Errorf("shared rules are read-only until the pair is synchronized or the writer is explicitly promoted: %w", config.ErrClusterUnavailable)
+var ErrFrozen = fmt.Errorf("shared rules are read-only until the peer is back and in sync, or this node is allowed to edit alone: %w", config.ErrClusterUnavailable)
 
 // PendingError means the transaction may already be durable on the peer.
 // It must be queried/retried, never presented as an ordinary rolled-back write.
@@ -64,17 +64,20 @@ type Handoff struct {
 // One atomic, checksummed checkpoint is authoritative. rules.json is its
 // materialized view, so a crash between those files is recoverable.
 type replicaDisk struct {
-	Sequence     int64                    `json:"sequence"`
-	Format       int                      `json:"format"`
-	NodeID       string                   `json:"nodeId"`
-	PeerID       string                   `json:"peerId"`
-	PairID       string                   `json:"pairId"`
-	Paired       bool                     `json:"paired"`
-	Writer       string                   `json:"writer"`
-	Epoch        int64                    `json:"epoch"`
-	Frozen       bool                     `json:"frozen"`
-	Takeover     bool                     `json:"takeover"`
-	Switched     bool                     `json:"switched"`
+	Sequence int64  `json:"sequence"`
+	Format   int    `json:"format"`
+	NodeID   string `json:"nodeId"`
+	PeerID   string `json:"peerId"`
+	PairID   string `json:"pairId"`
+	Paired   bool   `json:"paired"`
+	// Writer is the primary: it edits the shared rules and drives the router
+	// to itself. Each change of primary that skips a handoff raises Epoch, so
+	// the previous primary's late messages are refused and it can follow.
+	Writer string `json:"writer"`
+	Epoch  int64  `json:"epoch"`
+	// Claiming means this primary still has to point the router at itself.
+	Claiming bool `json:"claiming"`
+	// Degraded means edits were saved without the peer's acknowledgement.
 	Degraded     bool                     `json:"degraded"`
 	Committed    config.RuleSet           `json:"committed"`
 	Pending      *Transaction             `json:"pending,omitempty"`
@@ -214,6 +217,7 @@ func (r *Replica) Bootstrap(ctx context.Context) error {
 		next := config.WithWriter(d.Committed, 1, r.node, d.Committed)
 		d.PairID = nonce()
 		d.Epoch = 1
+		d.Claiming = true
 		d.Pending = &Transaction{ID: nonce(), PairID: d.PairID, Kind: "pair", Phase: "prepare", Next: next}
 		if err := r.save(d); err != nil {
 			return err
@@ -225,7 +229,7 @@ func (r *Replica) Commit(previous, next config.RuleSet) (config.RuleSet, error) 
 	r.op.Lock()
 	defer r.op.Unlock()
 	d := r.state()
-	if !d.Paired || d.Writer != r.node || d.Frozen || d.Transfer != nil {
+	if !d.Paired || d.Writer != r.node || d.Transfer != nil {
 		return previous, ErrFrozen
 	}
 	if d.Pending != nil {
@@ -330,7 +334,7 @@ func (r *Replica) Prepare(tx Transaction) error {
 	if d.LastID == tx.ID && d.Committed.Checksum == tx.Next.Checksum {
 		return nil
 	}
-	if d.Frozen || d.Transfer != nil || d.Degraded {
+	if d.Transfer != nil || d.Degraded {
 		return ErrFrozen
 	}
 	if tx.Kind == "pair" {
@@ -380,7 +384,7 @@ func (r *Replica) CommitPeer(pair, id string) error {
 	if d.LastID == id {
 		return nil
 	}
-	if d.Frozen || d.Degraded || d.Writer != r.cfg.PeerID {
+	if d.Degraded || d.Writer != r.cfg.PeerID {
 		return ErrFrozen
 	}
 	return r.acceptCommit(id)
@@ -392,7 +396,7 @@ func (r *Replica) Recover(ctx context.Context) error {
 	if d.Transfer != nil && d.Transfer.To == r.cfg.PeerID {
 		return r.finishHandoff(ctx)
 	}
-	if d.Pending != nil && d.Writer == r.node && !d.Frozen {
+	if d.Pending != nil && d.Writer == r.node {
 		if d.Degraded {
 			return r.acceptCommit(d.Pending.ID)
 		}
@@ -400,36 +404,17 @@ func (r *Replica) Recover(ctx context.Context) error {
 	}
 	return nil
 }
-func (r *Replica) FreezeTakeover() error {
+
+// SetClaiming records whether this primary still has to point the router at
+// itself.
+func (r *Replica) SetClaiming(on bool) error {
 	r.op.Lock()
 	defer r.op.Unlock()
 	d := r.state()
-	if !d.Paired || d.Transfer != nil {
-		return ErrFrozen
-	}
-	if d.Takeover {
+	if d.Claiming == on || (on && d.Writer != r.node) {
 		return nil
 	}
-	// A replica fences the absent writer: it archives the request that writer
-	// may never decide and refuses its delayed messages. A node that is itself
-	// the writer keeps its pending request and stays writable.
-	if d.Writer != r.node {
-		if d.Pending != nil {
-			if err := atomicJSON(r.path+".archive-"+nonce(), d); err != nil {
-				return err
-			}
-			d.Pending = nil
-		}
-		d.Frozen = true
-	}
-	d.Takeover = true
-	return r.save(d)
-}
-func (r *Replica) MarkSwitched() error {
-	r.op.Lock()
-	defer r.op.Unlock()
-	d := r.state()
-	d.Switched = true
+	d.Claiming = on
 	return r.save(d)
 }
 
@@ -465,7 +450,7 @@ func (r *Replica) BeginEdit(id, hash string, check Precondition) (*Reply, error)
 	if d.Pending != nil {
 		return nil, &PendingError{d.Pending.ID, config.ErrClusterUnavailable}
 	}
-	if !d.Paired || d.Writer != r.node || d.Frozen || d.Transfer != nil {
+	if !d.Paired || d.Writer != r.node || d.Transfer != nil {
 		return nil, ErrFrozen
 	}
 	if err := check(d.Committed); err != nil {
@@ -526,7 +511,7 @@ func (r *Replica) finishHandoff(ctx context.Context) error {
 		d.Writer = h.To
 		d.Epoch = h.Epoch
 		d.Committed = h.Snapshot
-		d.Frozen = false
+		d.Claiming = false
 		if err := r.save(d); err != nil {
 			return err
 		}
@@ -565,41 +550,107 @@ func (r *Replica) ReceiveHandoff(pair string, h Handoff, commit bool) error {
 	d.Writer = r.node
 	d.Epoch = h.Epoch
 	d.Committed = h.Snapshot
-	d.Frozen = false
+	d.Claiming = true
 	d.Degraded = false
 	d.Transfer = nil
 	d.LastTransfer = h.ID
 	return r.save(d)
 }
-func (r *Replica) Promote(fenced bool) error {
-	if !fenced {
-		return errors.New("confirm fencedPeer after stopping or isolating the previous writer")
-	}
+
+// Promote makes this node the primary at a new epoch without the peer's
+// consent, saving edits alone until the peer follows. A backup taking over
+// also has to claim the router. The previous primary's late messages carry
+// the old epoch and are refused.
+func (r *Replica) Promote() error {
 	r.op.Lock()
 	defer r.op.Unlock()
 	d := r.state()
 	if !d.Paired {
 		return ErrFrozen
 	}
-	if err := atomicJSON(r.path+".archive-"+nonce(), d); err != nil {
-		return err
+	// A backup drops the request the absent primary may never decide; it was
+	// never acknowledged, so the primary cannot have committed it either.
+	if d.Pending != nil || d.Transfer != nil {
+		if err := atomicJSON(r.path+".archive-"+nonce(), d); err != nil {
+			return err
+		}
+	}
+	if d.Writer != r.node {
+		d.Claiming = true
 	}
 	d.Epoch++
 	d.Writer = r.node
 	d.Committed = config.WithWriter(d.Committed, d.Epoch, r.node, d.Committed)
 	d.Pending = nil
 	d.Transfer = nil
-	d.Frozen = false
 	d.Degraded = true
-	d.PairID = nonce()
 	return r.save(d)
 }
 
-// Rejoin is explicit and archives all local state before adopting the selected
-// peer. The peer must subsequently confirm matching state to leave degraded mode.
+// follows reports whether this node can safely adopt the peer's state: the
+// peer is the primary at a newer epoch, or saved edits alone at ours. A node
+// that never saved alone has nothing the peer lacks, because it commits only
+// after the peer acknowledged.
+func follows(d replicaDisk, st PeerState, peer string) bool {
+	if !d.Paired || !st.Paired || st.PairID != d.PairID || st.NodeID != peer || st.Writer != peer || st.PendingID != "" || st.Transferring {
+		return false
+	}
+	if st.Epoch > d.Epoch {
+		return !d.Degraded
+	}
+	return st.Epoch == d.Epoch && d.Writer == peer && st.Degraded && st.Checksum != d.Committed.Checksum && d.Pending == nil
+}
+
+// diverged reports whether both nodes became primary and at least one of
+// them saved edits alone: only an operator can choose which edits to keep.
+func diverged(d replicaDisk, st PeerState, node, peer string) bool {
+	if !d.Paired || st.PairID != d.PairID || d.Writer != node || st.Writer != peer {
+		return false
+	}
+	switch {
+	case st.Epoch == d.Epoch:
+		return true
+	case st.Epoch > d.Epoch:
+		return d.Degraded
+	default:
+		return st.Degraded
+	}
+}
+
+// Follow adopts the snapshot of a peer that follows reports as newer.
+func (r *Replica) Follow(st PeerState, snap config.RuleSet) error {
+	r.op.Lock()
+	defer r.op.Unlock()
+	d := r.state()
+	if !follows(d, st, r.cfg.PeerID) {
+		return nil
+	}
+	if err := snap.Verify(); err != nil {
+		return err
+	}
+	if snap.ClusterID != r.cfg.ID || snap.Checksum != st.Checksum || snap.WriterID != st.NodeID || snap.WriterEpoch != st.Epoch {
+		return config.ErrRevisionConflict
+	}
+	if d.Pending != nil || d.Transfer != nil {
+		if err := atomicJSON(r.path+".archive-"+nonce(), d); err != nil {
+			return err
+		}
+	}
+	d.Writer = st.NodeID
+	d.Epoch = st.Epoch
+	d.Committed = snap
+	d.Pending = nil
+	d.Transfer = nil
+	d.Claiming = false
+	d.Degraded = false
+	return r.save(d)
+}
+
+// Rejoin is explicit and archives all local state before adopting the
+// peer's. It resolves a divergence by discarding this node's edits.
 func (r *Replica) Rejoin(ctx context.Context, discard bool) error {
 	if !discard {
-		return errors.New("confirm archiveLocal to archive divergent local state and adopt the peer")
+		return errors.New("confirm to archive this node's rules and adopt the peer's")
 	}
 	r.op.Lock()
 	defer r.op.Unlock()
@@ -608,7 +659,7 @@ func (r *Replica) Rejoin(ctx context.Context, discard bool) error {
 		return err
 	}
 	if out.Snapshot == nil || out.State == nil || !out.State.Paired || out.State.PendingID != "" || out.State.Transferring || out.State.Writer != r.cfg.PeerID {
-		return errors.New("peer must be an initialized configuration writer with no pending transaction")
+		return errors.New("the peer must be a primary with no pending update")
 	}
 	if err = out.Snapshot.Verify(); err != nil {
 		return err
@@ -627,7 +678,7 @@ func (r *Replica) Rejoin(ctx context.Context, discard bool) error {
 	d.Committed = *out.Snapshot
 	d.Pending = nil
 	d.Transfer = nil
-	d.Frozen = false
+	d.Claiming = false
 	d.Degraded = false
 	d.LastID = ""
 	d.Requests = map[string]RequestRecord{}
@@ -644,52 +695,5 @@ func (r *Replica) Resume(pair, checksum string, epoch int64) error {
 		return nil
 	}
 	d.Degraded = false
-	return r.save(d)
-}
-
-// The recovered writer reconciles only transactions for which the takeover
-// peer can prove the old or proposed committed checksum, then remains frozen.
-func (r *Replica) ObserveTakeover(peer PeerState) error {
-	r.op.Lock()
-	defer r.op.Unlock()
-	d := r.state()
-	if d.Writer != r.node || !d.Paired || peer.PairID != d.PairID || peer.Writer != r.node || peer.Epoch != d.Epoch {
-		return nil
-	}
-	if d.Pending != nil {
-		if peer.Checksum != d.Committed.Checksum && peer.Checksum != d.Pending.Next.Checksum {
-			return config.ErrRevisionConflict
-		}
-		if err := atomicJSON(r.path+".archive-"+nonce(), d); err != nil {
-			return err
-		}
-		if peer.Checksum == d.Pending.Next.Checksum {
-			if err := r.acceptCommit(d.Pending.ID); err != nil {
-				return err
-			}
-			d = r.state()
-		} else {
-			d.Pending = nil
-		}
-	}
-	if peer.Checksum != d.Committed.Checksum {
-		return config.ErrRevisionConflict
-	}
-	if d.Frozen {
-		return nil
-	}
-	d.Frozen = true
-	return r.save(d)
-}
-
-func (r *Replica) Rearm() error {
-	r.op.Lock()
-	defer r.op.Unlock()
-	d := r.state()
-	if !d.Paired || d.Pending != nil || d.Transfer != nil || d.Frozen || d.Degraded {
-		return ErrFrozen
-	}
-	d.Takeover = false
-	d.Switched = false
 	return r.save(d)
 }

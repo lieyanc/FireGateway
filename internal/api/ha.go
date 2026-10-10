@@ -16,7 +16,7 @@ func (s *Server) clusterStatus(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	rules := s.Store.Rules().Snapshot()
-	writeJSON(w, http.StatusOK, ha.Status{Role: "standalone", NodeID: s.Store.Get().Node.ID, DesiredRevision: rules.Revision, Checksum: rules.Checksum})
+	writeJSON(w, http.StatusOK, ha.Status{Role: "standalone", NodeID: s.Store.Get().Node.ID, Serving: s.Manager.Serving(), Ready: true, Sync: "unpaired", Writable: true, Issues: []ha.Issue{}, Details: ha.Details{Revision: rules.Revision, Checksum: rules.Checksum}})
 }
 
 func (s *Server) clusterBootstrap(w http.ResponseWriter, _ *http.Request) {
@@ -91,17 +91,27 @@ func (s *Server) clusterAction(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "bad_request", "cluster mode is not configured")
 		return
 	}
-	action := r.PathValue("action")
 	var body struct {
-		FencedPeer   bool `json:"fencedPeer"`
-		ArchiveLocal bool `json:"archiveLocal"`
+		// Target is the node to make primary on switchover.
+		Target string `json:"target"`
+		// Confirm acknowledges the consequences of promote and rejoin.
+		Confirm bool `json:"confirm"`
 	}
-	if action == "promote" || action == "rejoin" {
-		if !decode(w, r, &body, 4096) {
-			return
-		}
+	if !decode(w, r, &body, 4096) {
+		return
 	}
-	err := s.Cluster.Action(r.Context(), action, (action == "promote" && body.FencedPeer) || (action == "rejoin" && body.ArchiveLocal))
+	var err error
+	switch r.PathValue("action") {
+	case "switchover":
+		err = s.Cluster.Switchover(r.Context(), body.Target)
+	case "promote":
+		err = s.Cluster.Promote(body.Confirm)
+	case "rejoin":
+		err = s.Cluster.Rejoin(r.Context(), body.Confirm)
+	default:
+		fail(w, 404, "not_found", "unknown cluster action")
+		return
+	}
 	if err != nil {
 		failErr(w, err)
 		return

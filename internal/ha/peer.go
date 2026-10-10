@@ -19,8 +19,10 @@ import (
 	"github.com/lieyanc/FireGateway/internal/config"
 )
 
-// Protocol 3 moves the node link to its own mutual-TLS port.
-const Protocol = 3
+// Protocol 4 makes the primary the only writer and router owner: the peer
+// reports whether it serves, and a backup can ask to become primary
+// ("yield") or ask the primary to take the router back ("claim").
+const Protocol = 4
 
 const PeerTimeout = 8 * time.Second
 const RouterTimeout = 8 * time.Second
@@ -35,8 +37,7 @@ type PeerState struct {
 	Revision         int64  `json:"revision"`
 	Checksum         string `json:"checksum"`
 	PreparedChecksum string `json:"preparedChecksum"`
-	Frozen           bool   `json:"frozen"`
-	Takeover         bool   `json:"takeover"`
+	Serving          bool   `json:"serving"`
 	Degraded         bool   `json:"degraded"`
 	PendingID        string `json:"pendingId,omitempty"`
 	Transferring     bool   `json:"transferring"`
@@ -269,8 +270,10 @@ func (c *Controller) peerHandler() http.Handler {
 			}
 		case "resume":
 			err = c.replica.Resume(req.PairID, req.Checksum, req.Epoch)
-		case "rearm":
-			err = c.rearm(req.PairID, req.Epoch)
+		case "yield":
+			err = c.yield(r.Context(), req)
+		case "claim":
+			err = c.claimRequest(req)
 		case "mutate":
 			mutate := c.mutator.Load()
 			if req.Mutation == nil || mutate == nil || c.replica.state().Writer != c.node {

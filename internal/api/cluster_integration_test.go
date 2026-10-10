@@ -102,11 +102,11 @@ func TestRulesReplicateThroughAuthenticatedPeerAPI(t *testing.T) {
 	if code, out := b.do(t, "POST", "/api/rules", body, headers...); code != 201 || out["id"] != "1" {
 		t.Fatalf("standby proxy create: %d %v", code, out)
 	}
-	committed, version := ca.Status().Checksum, a.ruleVersion(t)
+	committed, version := ca.Status().Details.Checksum, a.ruleVersion(t)
 	if code, out := b.do(t, "POST", "/api/rules", body, headers...); code != 201 || out["id"] != "1" {
 		t.Fatalf("idempotent retry: %d %v", code, out)
 	}
-	if committed != ca.Status().Checksum {
+	if committed != ca.Status().Details.Checksum {
 		t.Fatal("retry published another revision")
 	}
 	headers[3] = "stale-request-0002"
@@ -128,7 +128,7 @@ func TestRulesReplicateThroughAuthenticatedPeerAPI(t *testing.T) {
 	if code, out := b.do(t, "GET", "/api/rules/1", ""); code != 200 || out["targetPort"] != float64(3000) {
 		t.Fatal("node override changed shared target")
 	}
-	if ca.Status().Checksum != cb.Status().Checksum || ca.Status().Checksum != committed {
+	if ca.Status().Details.Checksum != cb.Status().Details.Checksum || ca.Status().Details.Checksum != committed {
 		t.Fatal("local override changed shared version")
 	}
 	if code, out := a.do(t, "POST", "/api/cluster/transactions/create-request-0001", ""); code != 404 && code != 405 {
@@ -141,16 +141,16 @@ func TestRulesReplicateThroughAuthenticatedPeerAPI(t *testing.T) {
 	if code, _ := b.do(t, "POST", "/internal/ha/v1", `{"protocol":3}`); code == 200 {
 		t.Fatal("management API serves the node link")
 	}
-	if code, _ := b.do(t, "POST", "/api/cluster/promote", `{"archiveLocal":true}`); code == 200 {
-		t.Fatal("archive confirmation substituted for fencing confirmation")
+	if code, _ := b.do(t, "POST", "/api/cluster/promote", `{"confirm":true}`); code == 200 {
+		t.Fatal("promoted while the primary is online")
 	}
 	// A batch is one replicated publication, including its partial-item report.
 	headers = []string{"If-Match", version, "Idempotency-Key", "batch-request-0003"}
-	before := ca.Status().DesiredRevision
+	before := ca.Status().Details.Revision
 	if code, out := b.do(t, "POST", "/api/rules/batch", `{"action":"delete","ids":["1","missing"]}`, headers...); code != 200 || len(out["ok"].([]any)) != 1 || len(out["failed"].([]any)) != 1 {
 		t.Fatalf("batch: %d %v", code, out)
 	}
-	if ca.Status().DesiredRevision != before+1 {
+	if ca.Status().Details.Revision != before+1 {
 		t.Fatal("batch did not publish exactly once")
 	}
 

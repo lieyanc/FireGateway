@@ -15,36 +15,69 @@ import (
 	"github.com/lieyanc/FireGateway/internal/gateway"
 )
 
+// Status describes the pair in an operator's terms: which node is primary,
+// who forwards, whether the rules are in sync, and what needs attention.
 type Status struct {
-	PeerEpoch             int64      `json:"peerEpoch"`
-	TakenOver             bool       `json:"takenOver"`
-	PeerTakenOver         bool       `json:"peerTakenOver"`
-	InitialWriter         string     `json:"initialWriter"`
-	Enabled               bool       `json:"enabled"`
-	NodeID                string     `json:"nodeId"`
-	ClusterID             string     `json:"clusterId"`
-	Role                  string     `json:"role"`
-	Owner                 string     `json:"owner"`
-	Address               string     `json:"address"`
-	DesiredRevision       int64      `json:"desiredRevision"`
-	AppliedRevision       int64      `json:"appliedRevision"`
-	Checksum              string     `json:"checksum"`
-	Epoch                 int64      `json:"epoch"`
-	Paired                bool       `json:"paired"`
-	ConfigRole            string     `json:"configRole"`
-	Writer                string     `json:"writer"`
-	ReplicationState      string     `json:"replicationState"`
-	PeerState             string     `json:"peerState"`
-	PeerRevision          int64      `json:"peerRevision"`
-	PeerChecksum          string     `json:"peerChecksum"`
-	PeerPreparedChecksum  string     `json:"peerPreparedChecksum"`
-	LocalPreparedChecksum string     `json:"localPreparedChecksum"`
-	PendingUpdateID       string     `json:"pendingUpdateId,omitempty"`
-	UpstreamState         string     `json:"upstreamState"`
-	Error                 string     `json:"error,omitempty"`
-	SyncError             string     `json:"syncError,omitempty"`
-	LastSync              *time.Time `json:"lastSync,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	NodeID        string `json:"nodeId"`
+	PeerID        string `json:"peerId,omitempty"`
+	ClusterID     string `json:"clusterId,omitempty"`
+	InitialWriter string `json:"initialWriter,omitempty"`
+	Paired        bool   `json:"paired"`
+	// Role is primary, backup or standalone. The primary edits the shared
+	// rules and keeps the router pointing at itself.
+	Role string `json:"role"`
+	// Serving reports whether the router sends new connections to this node.
+	Serving bool `json:"serving"`
+	// Ready reports whether every active rule is bound on this node.
+	Ready bool `json:"ready"`
+	// Sync is unpaired, synced, syncing, waiting, local_only or conflict.
+	Sync string `json:"sync"`
+	// Writable reports whether shared rules can be edited through this node.
+	Writable bool          `json:"writable"`
+	Peer     PeerStatus    `json:"peer"`
+	Ingress  IngressStatus `json:"ingress"`
+	Issues   []Issue       `json:"issues"`
+	Details  Details       `json:"details"`
 }
+
+type PeerStatus struct {
+	// State is online, offline, error (reachable but misconfigured) or unknown.
+	State   string `json:"state"`
+	Role    string `json:"role,omitempty"`
+	Ready   bool   `json:"ready"`
+	Serving bool   `json:"serving"`
+}
+
+type IngressStatus struct {
+	// State is observed, switching, unavailable or unknown.
+	State   string `json:"state"`
+	Owner   string `json:"owner,omitempty"`
+	Address string `json:"address,omitempty"`
+}
+
+// Issue is something the operator should know or fix; Code is stable for
+// clients, Message carries the underlying error.
+type Issue struct {
+	Code    string `json:"code"`
+	Message string `json:"message,omitempty"`
+}
+
+type Details struct {
+	Epoch           int64      `json:"epoch"`
+	PeerEpoch       int64      `json:"peerEpoch"`
+	Revision        int64      `json:"revision"`
+	PeerRevision    int64      `json:"peerRevision"`
+	Checksum        string     `json:"checksum"`
+	PeerChecksum    string     `json:"peerChecksum,omitempty"`
+	PendingUpdateID string     `json:"pendingUpdateId,omitempty"`
+	LastSync        *time.Time `json:"lastSync,omitempty"`
+}
+
+// maxClaimTries bounds uncertain router switches per claim, so two nodes
+// that both believe they are primary cannot move ingress back and forth.
+const maxClaimTries = 3
+
 type Controller struct {
 	release   func()
 	closeOnce sync.Once
@@ -59,7 +92,8 @@ type Controller struct {
 	now       func() time.Time
 	server    *http.Server
 	mutator   atomic.Pointer[func(context.Context, Mutation) Reply]
-	kick      chan struct{}
+	kick      chan struct{} // runs the sync loop now
+	nudge     chan struct{} // runs the traffic loop now
 
 	// Lock order: traffic, writes, apply, mu. Only writes is ever held across
 	// a peer call, and the ingress path never takes it, so a slow or absent
@@ -69,7 +103,11 @@ type Controller struct {
 	traffic sync.Mutex // serializes ingress observation and router switches
 
 	mu             sync.RWMutex
-	status         Status
+	link           string // peer link: online, offline, error or unknown
+	syncErr        string
+	lastSync       *time.Time
+	split          bool // both nodes are primary and at least one saved alone
+	ingress        IngressStatus
 	peerInfo       *PeerState
 	offlineSince   time.Time // peer unreachable since
 	unhealthySince time.Time // peer reachable but unable to forward since
@@ -78,6 +116,7 @@ type Controller struct {
 	readyErr       string    // why this node is not ready
 	ingressErr     string    // last router observation or switch failure
 	switchHold     time.Time // an uncertain switch may still roll back until then
+	claimTries     int       // uncertain switches of the current claim
 }
 
 // UsageExchange shares per-tenant traffic counts with the peer so quotas
@@ -102,7 +141,7 @@ func NewController(store *config.Store, mgr *gateway.Manager, upstream Upstream,
 		release()
 		return nil, err
 	}
-	c := &Controller{release: release, store: store, mgr: mgr, cfg: cfg, node: node, replica: r, peer: peer, upstream: upstream, now: time.Now, kick: make(chan struct{}, 1), status: Status{Enabled: true, NodeID: node, ClusterID: cfg.ID, InitialWriter: cfg.InitialWriter, PeerState: "unknown", UpstreamState: "unknown"}}
+	c := &Controller{release: release, store: store, mgr: mgr, cfg: cfg, node: node, replica: r, peer: peer, upstream: upstream, now: time.Now, kick: make(chan struct{}, 1), nudge: make(chan struct{}, 1), link: "unknown", ingress: IngressStatus{State: "unknown"}}
 	// The durable journal is the only authority after bootstrap, never an
 	// arbitrary rules.json that was edited while the process was stopped.
 	if err = store.Rules().Restore(r.state().Committed); err != nil {
@@ -113,11 +152,14 @@ func NewController(store *config.Store, mgr *gateway.Manager, upstream Upstream,
 	return c, nil
 }
 
-// wake asks the sync loop to run now, e.g. after the peer committed a change.
+// wake runs both loops now, e.g. after the peer committed a change or handed
+// this node the primary role.
 func (c *Controller) wake() {
-	select {
-	case c.kick <- struct{}{}:
-	default:
+	for _, ch := range []chan struct{}{c.kick, c.nudge} {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -134,7 +176,7 @@ func (c *Controller) peerState() PeerState {
 	if c.ready(d) {
 		prepared = d.Committed.Checksum
 	}
-	out := PeerState{NodeID: c.node, PairID: d.PairID, Paired: d.Paired, Writer: d.Writer, Epoch: d.Epoch, Revision: d.Committed.Revision, Checksum: d.Committed.Checksum, PreparedChecksum: prepared, Frozen: d.Frozen, Takeover: d.Takeover, Degraded: d.Degraded, Transferring: d.Transfer != nil}
+	out := PeerState{NodeID: c.node, PairID: d.PairID, Paired: d.Paired, Writer: d.Writer, Epoch: d.Epoch, Revision: d.Committed.Revision, Checksum: d.Committed.Checksum, PreparedChecksum: prepared, Serving: c.mgr.Serving(), Degraded: d.Degraded, Transferring: d.Transfer != nil}
 	if d.Pending != nil {
 		out.PendingID = d.Pending.ID
 	}
@@ -143,69 +185,97 @@ func (c *Controller) peerState() PeerState {
 	}
 	return out
 }
+
 func (c *Controller) Status() Status {
 	c.mu.RLock()
-	out := c.status
+	link, syncErr, lastSync, split := c.link, c.syncErr, c.lastSync, c.split
+	in, ingressErr, readyErr := c.ingress, c.ingressErr, c.readyErr
 	peer := clone(c.peerInfo)
-	out.Error = strings.Join(nonEmpty(c.ingressErr, c.readyErr), "; ")
 	c.mu.RUnlock()
 	d := c.replica.state()
-	ready := c.ready(d)
-	out.Paired = d.Paired
-	out.TakenOver = d.Takeover || d.Switched
-	out.Writer = d.Writer
-	out.Epoch = d.Epoch
-	out.DesiredRevision = d.Committed.Revision
-	out.Checksum = d.Committed.Checksum
-	out.AppliedRevision = c.store.Rules().Snapshot().Revision
-	out.ConfigRole = "replica"
-	if d.Writer == c.node {
-		out.ConfigRole = "writer"
+	out := Status{Enabled: true, NodeID: c.node, PeerID: c.cfg.PeerID, ClusterID: c.cfg.ID, InitialWriter: c.cfg.InitialWriter, Paired: d.Paired, Role: "backup", Serving: c.mgr.Serving(), Ready: c.ready(d), Ingress: in, Peer: PeerStatus{State: link}, Issues: []Issue{}}
+	primary := d.Writer == c.node
+	if primary {
+		out.Role = "primary"
 	}
-	if d.Frozen || d.Transfer != nil || (!d.Degraded && out.PeerState != "online") {
-		out.ConfigRole = "read_only"
+	online := link == "online" && peer != nil && peer.PairID == d.PairID
+	if online {
+		out.Peer.Role = "backup"
+		if peer.Writer == peer.NodeID {
+			out.Peer.Role = "primary"
+		}
+		out.Peer.Ready = peer.PreparedChecksum != "" && peer.PreparedChecksum == peer.Checksum
+		out.Peer.Serving = peer.Serving
 	}
-	out.ReplicationState = "waiting"
-	if d.Degraded {
-		out.ReplicationState = "local_only"
-	} else if d.Pending != nil {
-		out.ReplicationState = "pending"
-		out.PendingUpdateID = d.Pending.ID
-	} else if peer != nil && out.PeerState == "online" && peer.PairID == d.PairID && peer.Checksum == d.Committed.Checksum {
-		out.ReplicationState = "synced"
-	}
-	if !d.Paired {
-		out.ReplicationState = "unpaired"
-	}
-	if peer != nil {
-		out.PeerRevision = peer.Revision
-		out.PeerEpoch = peer.Epoch
-		out.PeerChecksum = peer.Checksum
-		out.PeerPreparedChecksum = peer.PreparedChecksum
-		out.PeerTakenOver = peer.Takeover
-	}
-	if ready {
-		out.LocalPreparedChecksum = d.Committed.Checksum
+	if primary && d.Claiming && in.State == "observed" && in.Owner != c.node {
+		out.Ingress.State = "switching"
 	}
 	switch {
-	case c.mgr.Serving():
-		out.Role = "active"
-	case ready:
-		out.Role = "standby"
+	case !d.Paired:
+		out.Sync = "unpaired"
+	case split:
+		out.Sync = "conflict"
+	case d.Degraded:
+		out.Sync = "local_only"
+	case d.Pending != nil || d.Transfer != nil:
+		out.Sync = "syncing"
+	case online && peer.Epoch == d.Epoch && peer.Checksum == d.Committed.Checksum:
+		out.Sync = "synced"
 	default:
-		out.Role = "disconnected"
+		out.Sync = "waiting"
 	}
-	if d.Takeover && !d.Switched && out.UpstreamState != "unavailable" {
-		out.UpstreamState = "switch_pending"
+	// Mirrors Mutate: the primary needs the peer in step unless it saves
+	// alone; a backup forwards edits to an online primary.
+	agreed := online && peer.Writer == d.Writer && peer.Epoch == d.Epoch
+	out.Writable = d.Paired && d.Transfer == nil && d.Pending == nil && ((primary && (d.Degraded || agreed)) || (!primary && agreed))
+
+	add := func(code, msg string) { out.Issues = append(out.Issues, Issue{code, msg}) }
+	if !d.Paired {
+		add("unpaired", "")
 	}
-	return out
-}
-func nonEmpty(values ...string) []string {
-	out := values[:0]
-	for _, v := range values {
-		if v != "" {
-			out = append(out, v)
+	switch link {
+	case "offline":
+		add("peer_offline", syncErr)
+	case "error":
+		add("peer_error", syncErr)
+	case "online":
+		if syncErr != "" {
+			add("sync_error", syncErr)
 		}
+	}
+	if split {
+		add("conflict", "")
+	}
+	if d.Paired && !out.Ready {
+		add("not_ready", readyErr)
+	}
+	if online && d.Paired && !out.Peer.Ready {
+		add("peer_not_ready", "")
+	}
+	switch {
+	case in.State == "unavailable":
+		add("router_unavailable", ingressErr)
+	case ingressErr != "":
+		add("ingress_error", ingressErr)
+	}
+	if in.State == "observed" && in.Owner == "" {
+		add("ingress_unknown", in.Address)
+	}
+	if primary && d.Paired && !d.Claiming && in.State == "observed" && in.Owner == c.cfg.PeerID {
+		add("ingress_elsewhere", "")
+	}
+	if d.Degraded {
+		add("local_only", "")
+	} else if primary && d.Paired && !online {
+		add("read_only", "")
+	}
+
+	out.Details = Details{Epoch: d.Epoch, Revision: d.Committed.Revision, Checksum: d.Committed.Checksum, LastSync: lastSync}
+	if d.Pending != nil {
+		out.Details.PendingUpdateID = d.Pending.ID
+	}
+	if peer != nil {
+		out.Details.PeerEpoch, out.Details.PeerRevision, out.Details.PeerChecksum = peer.Epoch, peer.Revision, peer.Checksum
 	}
 	return out
 }
@@ -254,30 +324,46 @@ func (c *Controller) Bootstrap() error {
 	if err := c.replica.Bootstrap(ctx); err != nil {
 		return err
 	}
+	defer c.wake()
 	return c.refresh()
 }
-func (c *Controller) Action(ctx context.Context, action string, confirmed bool) error {
-	if action == "failback" {
-		return c.Failback(ctx)
+
+// Promote lets this node save edits alone while the peer is unreachable; a
+// backup also takes over ingress. The peer follows once it is back, unless
+// it saved edits alone too.
+func (c *Controller) Promote(confirmed bool) error {
+	if !confirmed {
+		return errors.New("confirm saving edits on this node alone")
 	}
+	c.writes.Lock()
+	defer c.writes.Unlock()
+	c.mu.RLock()
+	online := c.link == "online"
+	c.mu.RUnlock()
+	if online {
+		return errors.New("the peer is online; switch over instead")
+	}
+	if err := c.replica.Promote(); err != nil {
+		return err
+	}
+	c.resetClaim()
+	defer c.wake()
+	return c.refresh()
+}
+
+// Rejoin discards this node's rules, archived first, and adopts the peer's.
+func (c *Controller) Rejoin(ctx context.Context, confirmed bool) error {
 	c.writes.Lock()
 	defer c.writes.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, PeerTimeout)
 	defer cancel()
-	var err error
-	switch action {
-	case "transfer":
-		err = c.replica.Transfer(ctx)
-	case "promote":
-		err = c.replica.Promote(confirmed)
-	case "rejoin":
-		err = c.replica.Rejoin(ctx, confirmed)
-	default:
-		return errors.New("unknown cluster action")
-	}
-	if err != nil {
+	if err := c.replica.Rejoin(ctx, confirmed); err != nil {
 		return err
 	}
+	c.mu.Lock()
+	c.split = false
+	c.mu.Unlock()
+	defer c.wake()
 	return c.refresh()
 }
 func errorReply(err error) Reply {
@@ -311,7 +397,7 @@ func (c *Controller) Mutate(ctx context.Context, req Mutation, exec Executor) Re
 	}
 	d := c.replica.state()
 	if d.Writer != c.node {
-		if d.Frozen || !d.Paired {
+		if !d.Paired {
 			return errorReply(ErrFrozen)
 		}
 		out, err := c.peer.Call(ctx, "mutate", PeerRequest{Mutation: &req})
@@ -356,7 +442,7 @@ func (c *Controller) Mutate(ctx context.Context, req Mutation, exec Executor) Re
 	}
 	c.mu.RLock()
 	info := clone(c.peerInfo)
-	online := c.status.PeerState == "online"
+	online := c.link == "online"
 	c.mu.RUnlock()
 	current := c.replica.state()
 	if !current.Degraded && (!online || info == nil || info.PairID != current.PairID || info.Epoch != current.Epoch || info.Writer != current.Writer) {
@@ -391,33 +477,68 @@ func (c *Controller) Transaction(id string) (any, bool) {
 	return nil, false
 }
 
-// SyncStep exchanges state with the peer, finishes interrupted replication
-// and keeps the local listeners ready for the committed rules.
+// SyncStep exchanges state with the peer, follows a newer primary, finishes
+// interrupted replication and keeps the local listeners ready for the
+// committed rules.
 func (c *Controller) SyncStep(ctx context.Context) error {
 	peer, err := c.heartbeat(ctx)
 	c.writes.Lock()
 	defer c.writes.Unlock()
 	errs := []error{err}
-	if peer != nil && peer.Frozen && peer.Takeover {
-		errs = append(errs, c.replica.ObserveTakeover(*peer))
-	}
-	recoverCtx, done := context.WithTimeout(ctx, PeerTimeout)
+	stepCtx, done := context.WithTimeout(ctx, PeerTimeout)
 	defer done()
-	errs = append(errs, c.replica.Recover(recoverCtx))
 	d := c.replica.state()
-	if peer != nil && peer.Degraded && d.Writer == c.cfg.PeerID && peer.PairID == d.PairID && peer.Checksum == d.Committed.Checksum {
-		_, e := c.peer.Call(recoverCtx, "resume", PeerRequest{PairID: d.PairID, Checksum: d.Committed.Checksum, Epoch: d.Epoch})
+	split := false
+	if peer != nil {
+		split = diverged(d, *peer, c.node, c.cfg.PeerID)
+		if follows(d, *peer, c.cfg.PeerID) {
+			errs = append(errs, c.follow(stepCtx))
+		}
+	}
+	errs = append(errs, c.replica.Recover(stepCtx))
+	d = c.replica.state()
+	if peer != nil && peer.Degraded && d.Writer == c.cfg.PeerID && peer.PairID == d.PairID && peer.Epoch == d.Epoch && peer.Checksum == d.Committed.Checksum {
+		_, e := c.peer.Call(stepCtx, "resume", PeerRequest{PairID: d.PairID, Checksum: d.Committed.Checksum, Epoch: d.Epoch})
 		errs = append(errs, e)
 	}
-	err = errors.Join(errs...)
-	if err != nil {
-		c.mu.Lock()
-		c.status.SyncError = err.Error()
-		c.mu.Unlock()
+	if peer != nil && c.handBack(d, *peer) {
+		errs = append(errs, c.replica.Transfer(stepCtx))
 	}
+	err = errors.Join(errs...)
+	c.mu.Lock()
+	c.split = split
+	if err != nil {
+		c.syncErr = err.Error()
+	}
+	c.mu.Unlock()
 	// Readiness errors are reported separately; they are not sync failures.
 	_ = c.refresh()
 	return err
+}
+
+// follow adopts the state of a peer that became primary while this node was
+// away, or that saved edits alone.
+func (c *Controller) follow(ctx context.Context) error {
+	out, err := c.peer.Call(ctx, "snapshot", PeerRequest{})
+	if err != nil {
+		return err
+	}
+	if out.State == nil || out.Snapshot == nil {
+		return &PeerFault{"peer omitted its snapshot"}
+	}
+	return c.replica.Follow(*out.State, *out.Snapshot)
+}
+
+// handBack reports whether the router was pointed at the peer from outside
+// while both nodes agree on the rules. The primary then hands its role to
+// the node that has the traffic instead of taking the traffic back.
+func (c *Controller) handBack(d replicaDisk, st PeerState) bool {
+	c.mu.RLock()
+	in := c.ingress
+	c.mu.RUnlock()
+	return d.Paired && d.Writer == c.node && !d.Claiming && !d.Degraded && d.Pending == nil && d.Transfer == nil &&
+		in.State == "observed" && in.Owner == c.cfg.PeerID &&
+		st.PairID == d.PairID && st.Epoch == d.Epoch && st.Checksum == d.Committed.Checksum && st.PreparedChecksum == st.Checksum
 }
 
 // heartbeat records the peer's reachability and health. Errors that prove
@@ -438,14 +559,14 @@ func (c *Controller) heartbeat(ctx context.Context) (*PeerState, error) {
 		c.unhealthySince = time.Time{}
 		if c.peerFault {
 			c.offlineSince = time.Time{}
-			c.status.PeerState = "error"
+			c.link = "error"
 		} else {
 			if c.offlineSince.IsZero() {
 				c.offlineSince = now
 			}
-			c.status.PeerState = "offline"
+			c.link = "offline"
 		}
-		c.status.SyncError = err.Error()
+		c.syncErr = err.Error()
 		return nil, err
 	}
 	st := out.State
@@ -455,18 +576,18 @@ func (c *Controller) heartbeat(ctx context.Context) (*PeerState, error) {
 	}
 	c.offlineSince = time.Time{}
 	c.peerFault = false
-	// The peer is unhealthy when it holds our committed rules but cannot
+	// The primary is unhealthy when it holds our committed rules but cannot
 	// forward them. Differing checksums mean replication is mid-flight.
-	if st.PairID == d.PairID && st.Checksum == d.Committed.Checksum && st.PreparedChecksum != st.Checksum {
+	if st.PairID == d.PairID && st.Writer == st.NodeID && st.Checksum == d.Committed.Checksum && st.PreparedChecksum != st.Checksum {
 		if c.unhealthySince.IsZero() {
 			c.unhealthySince = now
 		}
 	} else {
 		c.unhealthySince = time.Time{}
 	}
-	c.status.PeerState = "online"
-	c.status.SyncError = ""
-	c.status.LastSync = &now
+	c.link = "online"
+	c.syncErr = ""
+	c.lastSync = &now
 	return st, nil
 }
 func isFault(err error) bool {
@@ -477,7 +598,8 @@ func isFault(err error) bool {
 // TrafficStep follows the router. Its DNAT destination is the only arbiter of
 // who forwards: the gate opens exactly while the router points here. When
 // the router cannot be read the last observed role stands, so a router API
-// outage never interrupts forwarding.
+// outage never interrupts forwarding. The primary points the router at
+// itself when it has to; a backup takes over from a failed primary.
 func (c *Controller) TrafficStep(ctx context.Context) error {
 	c.traffic.Lock()
 	defer c.traffic.Unlock()
@@ -486,7 +608,7 @@ func (c *Controller) TrafficStep(ctx context.Context) error {
 	cancel()
 	if err != nil {
 		c.mu.Lock()
-		c.status.UpstreamState = "unavailable"
+		c.ingress.State = "unavailable"
 		c.ingressErr = err.Error()
 		c.mu.Unlock()
 		return err
@@ -494,22 +616,12 @@ func (c *Controller) TrafficStep(ctx context.Context) error {
 	d := c.replica.state()
 	mine := in.Address == c.cfg.Address
 	c.mgr.SetServing(mine && d.Paired)
-	c.mu.Lock()
-	c.status.Address = in.Address
-	c.status.Owner = ""
-	switch in.Address {
-	case c.cfg.Address:
-		c.status.Owner = c.node
-	case c.cfg.PeerAddress:
-		c.status.Owner = c.cfg.PeerID
-	}
-	c.status.UpstreamState = "observed"
-	c.mu.Unlock()
+	c.observe(in.Address)
 	switch {
-	case d.Takeover && !d.Switched:
-		err = c.converge(ctx, in, mine)
-	case !mine && c.ready(d) && c.takeoverDue(ctx, d):
-		err = c.takeover(ctx, in)
+	case d.Paired && d.Writer == c.node && d.Claiming:
+		err = c.claim(ctx, in, mine)
+	case d.Paired && d.Writer != c.node && c.ready(d) && c.takeoverDue(ctx, d):
+		err = c.takeover(ctx, in, mine)
 	}
 	c.mu.Lock()
 	c.ingressErr = ""
@@ -520,11 +632,25 @@ func (c *Controller) TrafficStep(ctx context.Context) error {
 	return err
 }
 
-// takeoverDue decides whether this node should claim ingress from its peer.
-// Only the designated backup takes over, once until failback, so two nodes
-// that cannot see each other never pass ingress back and forth.
+func (c *Controller) observe(address string) {
+	owner := ""
+	switch address {
+	case c.cfg.Address:
+		owner = c.node
+	case c.cfg.PeerAddress:
+		owner = c.cfg.PeerID
+	}
+	c.mu.Lock()
+	c.ingress = IngressStatus{State: "observed", Owner: owner, Address: address}
+	c.mu.Unlock()
+}
+
+// takeoverDue decides whether this backup should replace the primary. Only
+// a backup takes over, and a primary that lost ingress while cut off stays
+// primary in its own view until it hears from the peer and follows it, so
+// two nodes that cannot see each other never pass ingress back and forth.
 func (c *Controller) takeoverDue(ctx context.Context, d replicaDisk) bool {
-	if c.node == c.cfg.InitialWriter || d.Switched || !d.Paired {
+	if !d.Paired || d.Writer == c.node {
 		return false
 	}
 	c.mu.RLock()
@@ -547,121 +673,154 @@ func (c *Controller) takeoverDue(ctx context.Context, d replicaDisk) bool {
 	return false
 }
 
-// takeover fences the peer's configuration writes and points the router here.
-func (c *Controller) takeover(ctx context.Context, in Ingress) error {
-	if err := c.replica.FreezeTakeover(); err != nil {
+// takeover makes this backup the primary at a new epoch, which fences the
+// old primary's late writes, then points the router here.
+func (c *Controller) takeover(ctx context.Context, in Ingress, mine bool) error {
+	if err := c.replica.Promote(); err != nil {
 		return err
 	}
-	// Prepare again after the freeze: a commit may have landed since the last
-	// readiness check, and the router must never point at unbound listeners.
+	c.resetClaim()
+	return c.claim(ctx, in, mine)
+}
+
+func (c *Controller) resetClaim() {
+	c.mu.Lock()
+	c.switchHold, c.claimTries = time.Time{}, 0
+	c.mu.Unlock()
+}
+
+// claim points the router at this primary. A switch whose outcome is
+// uncertain is not repeated until OpenWrt's rollback window has passed; the
+// router then shows whether it stuck. Router already pointing here at the
+// first look may stem from such a switch before a restart, so that is held
+// for one window too.
+func (c *Controller) claim(ctx context.Context, in Ingress, mine bool) error {
+	now := c.now()
+	c.mu.Lock()
+	if mine && c.switchHold.IsZero() {
+		c.switchHold = now.Add(RollbackWindow)
+	}
+	hold, tries := c.switchHold, c.claimTries
+	c.mu.Unlock()
+	if now.Before(hold) {
+		return nil
+	}
+	if mine {
+		c.resetClaim()
+		return c.replica.SetClaiming(false)
+	}
+	if tries >= maxClaimTries {
+		return errors.New("the router keeps returning to the peer; check the node link and the router, then switch over again")
+	}
+	// Bind again right before switching: the router must never point at
+	// listeners that are not ready.
 	if err := c.refresh(); err != nil {
-		return err
+		return fmt.Errorf("this node is not ready to forward: %w", err)
 	}
 	switchCtx, cancel := context.WithTimeout(ctx, RouterTimeout)
 	err := c.upstream.Switch(switchCtx, in, c.cfg.Address)
 	cancel()
 	if errors.Is(err, ErrSwitchUncertain) {
 		c.mu.Lock()
-		c.switchHold = c.now().Add(RollbackWindow)
-		c.mu.Unlock()
-	}
-	if err != nil {
-		return err
-	}
-	if err = c.replica.MarkSwitched(); err != nil {
-		return err
-	}
-	c.mgr.SetServing(true)
-	c.mu.Lock()
-	c.status.Owner, c.status.Address = c.node, c.cfg.Address
-	c.mu.Unlock()
-	return nil
-}
-
-// converge settles a takeover whose switch was not confirmed. The router
-// decides: pointing here past OpenWrt's rollback window, the switch is
-// final; pointing at the peer, it is retried while takeover is still due.
-// A peer that came back healthy keeps ingress until the operator fails back.
-func (c *Controller) converge(ctx context.Context, in Ingress, mine bool) error {
-	now := c.now()
-	c.mu.Lock()
-	if mine && c.switchHold.IsZero() {
-		// After a restart the hold restarts at the first observation.
 		c.switchHold = now.Add(RollbackWindow)
-	}
-	hold := c.switchHold
-	c.mu.Unlock()
-	if now.Before(hold) {
-		return nil
-	}
-	if mine {
-		c.mu.Lock()
-		c.switchHold = time.Time{}
+		c.claimTries++
 		c.mu.Unlock()
-		return c.replica.MarkSwitched()
 	}
-	if !c.takeoverDue(ctx, c.replica.state()) {
-		return nil
-	}
-	return c.takeover(ctx, in)
-}
-
-// Failback returns ingress to the initial primary after a takeover and
-// re-arms automatic takeover on the backup. It runs on the initial primary,
-// once both nodes are back in sync under one configuration writer.
-func (c *Controller) Failback(ctx context.Context) error {
-	if c.node != c.cfg.InitialWriter {
-		return fmt.Errorf("fail back from the initial primary %s", c.cfg.InitialWriter)
-	}
-	c.traffic.Lock()
-	defer c.traffic.Unlock()
-	probe, cancel := context.WithTimeout(ctx, PeerTimeout)
-	out, err := c.peer.Call(probe, "heartbeat", PeerRequest{})
-	cancel()
-	if err != nil {
-		return fmt.Errorf("the peer must be online to fail back: %w", err)
-	}
-	d, st := c.replica.state(), out.State
-	if st == nil || d.Frozen || d.Pending != nil || d.Transfer != nil || d.Degraded || st.Frozen || st.PendingID != "" || st.Transferring || st.Degraded || st.PairID != d.PairID || st.Epoch != d.Epoch || st.Checksum != d.Committed.Checksum {
-		return fmt.Errorf("transfer the configuration writer and let both nodes sync before failing back: %w", ErrFrozen)
-	}
-	if err = c.refresh(); err != nil {
-		return fmt.Errorf("this node is not ready to forward: %w", err)
-	}
-	readCtx, cancel := context.WithTimeout(ctx, RouterTimeout)
-	in, err := c.upstream.Read(readCtx)
-	if err == nil && in.Address != c.cfg.Address {
-		err = c.upstream.Switch(readCtx, in, c.cfg.Address)
-	}
-	cancel()
 	if err != nil {
 		return err
 	}
 	c.mgr.SetServing(true)
-	c.mu.Lock()
-	c.status.Owner, c.status.Address, c.ingressErr = c.node, c.cfg.Address, ""
-	c.mu.Unlock()
-	if !st.Takeover {
-		return nil
-	}
-	rearmCtx, cancel := context.WithTimeout(ctx, PeerTimeout)
-	defer cancel()
-	_, err = c.peer.Call(rearmCtx, "rearm", PeerRequest{PairID: d.PairID, Epoch: d.Epoch})
-	return err
+	c.observe(c.cfg.Address)
+	c.resetClaim()
+	return c.replica.SetClaiming(false)
 }
 
-// rearm runs on the backup when the initial primary has failed back.
-func (c *Controller) rearm(pair string, epoch int64) error {
+// inSync fetches the peer's state and requires both nodes to hold the same
+// committed rules with nothing in flight, the precondition of a switchover.
+func (c *Controller) inSync(ctx context.Context) (*PeerState, error) {
+	st, err := c.heartbeat(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("the peer must be online to switch over: %w", err)
+	}
 	d := c.replica.state()
-	if pair != d.PairID || epoch != d.Epoch {
+	if !d.Paired || st.PairID != d.PairID || st.Epoch != d.Epoch || st.Checksum != d.Committed.Checksum || d.Degraded || st.Degraded || d.Pending != nil || st.PendingID != "" || d.Transfer != nil || st.Transferring {
+		return nil, fmt.Errorf("wait until both nodes are in sync, then switch over: %w", config.ErrClusterUnavailable)
+	}
+	return st, nil
+}
+
+// Switchover makes target, this node or its peer, the primary. The role is
+// handed over first and the new primary then points the router at itself,
+// so a failure halfway leaves a primary that keeps trying, never two.
+func (c *Controller) Switchover(ctx context.Context, target string) error {
+	switch target {
+	case c.node:
+		if err := c.refresh(); err != nil {
+			return fmt.Errorf("this node is not ready to forward: %w", err)
+		}
+		if d := c.replica.state(); d.Writer != c.node {
+			if _, err := c.inSync(ctx); err != nil {
+				return err
+			}
+			callCtx, cancel := context.WithTimeout(ctx, PeerTimeout)
+			_, err := c.peer.Call(callCtx, "yield", PeerRequest{PairID: d.PairID, Epoch: d.Epoch, Checksum: d.Committed.Checksum})
+			cancel()
+			if err != nil {
+				return err
+			}
+		} else if err := c.replica.SetClaiming(true); err != nil {
+			return err
+		}
+		c.resetClaim()
+		return c.TrafficStep(ctx)
+	case c.cfg.PeerID:
+		c.writes.Lock()
+		defer c.writes.Unlock()
+		d := c.replica.state()
+		callCtx, cancel := context.WithTimeout(ctx, PeerTimeout)
+		defer cancel()
+		if d.Writer != c.node {
+			_, err := c.peer.Call(callCtx, "claim", PeerRequest{PairID: d.PairID, Epoch: d.Epoch})
+			return err
+		}
+		st, err := c.inSync(callCtx)
+		if err != nil {
+			return err
+		}
+		if st.PreparedChecksum != st.Checksum {
+			return fmt.Errorf("the peer is not ready to forward these rules: %w", config.ErrClusterUnavailable)
+		}
+		// The peer is woken by the handoff and claims the router itself.
+		return c.replica.Transfer(callCtx)
+	}
+	return fmt.Errorf("unknown node %q", target)
+}
+
+// yield hands the primary role to the peer on its request.
+func (c *Controller) yield(ctx context.Context, req PeerRequest) error {
+	c.writes.Lock()
+	defer c.writes.Unlock()
+	d := c.replica.state()
+	if d.Writer != c.node {
+		return nil
+	}
+	if req.PairID != d.PairID || req.Epoch != d.Epoch || req.Checksum != d.Committed.Checksum {
+		return fmt.Errorf("the nodes are not in sync yet: %w", config.ErrRevisionConflict)
+	}
+	return c.replica.Transfer(ctx)
+}
+
+// claimRequest makes this primary point the router at itself on the
+// peer's request.
+func (c *Controller) claimRequest(req PeerRequest) error {
+	d := c.replica.state()
+	if req.PairID != d.PairID || d.Writer != c.node {
 		return config.ErrRevisionConflict
 	}
-	if err := c.replica.Rearm(); err != nil {
+	if err := c.replica.SetClaiming(true); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	c.switchHold = time.Time{}
-	c.mu.Unlock()
+	c.resetClaim()
 	return nil
 }
 
@@ -696,7 +855,7 @@ func (c *Controller) Run(ctx context.Context) {
 		}()
 	}
 	loop(c.SyncStep, c.kick)
-	loop(c.TrafficStep, nil)
+	loop(c.TrafficStep, c.nudge)
 	<-ctx.Done()
 	c.mgr.SetServing(false)
 	wg.Wait()
