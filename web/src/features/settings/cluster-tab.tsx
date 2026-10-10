@@ -1,13 +1,21 @@
 import * as React from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import {
+  ChevronDownIcon,
+  CircleAlertIcon,
+  CircleCheckIcon,
+  TriangleAlertIcon,
+} from "lucide-react"
 import { toast } from "sonner"
 
+import { ConfirmDialog } from "@/components/common/confirm-dialog"
 import { QueryError } from "@/components/common/query-state"
-import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Card,
+  CardAction,
   CardHeader,
   CardTitle,
   CardDescription,
@@ -15,20 +23,32 @@ import {
   CardFooter,
 } from "@/components/ui/card"
 import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible"
+import {
   Field,
   FieldGroup,
   FieldLabel,
   FieldDescription,
 } from "@/components/ui/field"
-import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Spinner } from "@/components/ui/spinner"
-import { useI18n } from "@/i18n"
+import { useI18n, type MessageKey } from "@/i18n"
 import { api } from "@/lib/api"
 import { toastError } from "@/lib/errors"
 import { useRules } from "@/lib/queries"
-import type { NodeInfo, NodeConfig, RuleView, ClusterStatus } from "@/lib/types"
+import type {
+  ClusterIssue,
+  ClusterStatus,
+  ClusterSync,
+  NodeConfig,
+  NodeInfo,
+  RuleView,
+} from "@/lib/types"
+import { cn } from "@/lib/utils"
 import { ClusterConnectionSettings } from "@/features/settings/cluster-connection"
 
 export function ClusterTab() {
@@ -62,6 +82,7 @@ export function ClusterTab() {
   if (!status.data || !node.data || !rules.data)
     return <Skeleton className="h-64" />
   const state = status.data
+  const canPair = state.initialWriter === state.nodeId
   return (
     <div className="flex flex-col gap-4">
       <ClusterConnectionSettings />
@@ -69,109 +90,35 @@ export function ClusterTab() {
         <CardHeader>
           <CardTitle>{t("cluster.title")}</CardTitle>
           <CardDescription>{t("cluster.description")}</CardDescription>
+          <CardAction>
+            {state.enabled ? (
+              <SyncBadge sync={state.sync} />
+            ) : (
+              <Badge variant="secondary">{t("cluster.standalone")}</Badge>
+            )}
+          </CardAction>
         </CardHeader>
         <CardContent className="flex flex-col gap-4">
-          <div>
-            <Badge variant={state.role === "active" ? "default" : "secondary"}>
-              {t(`cluster.${state.role}`)}
-            </Badge>
-          </div>
-          <dl className="grid grid-cols-2 gap-2">
-            {(
-              [
-                [t("cluster.node"), state.nodeId || "—"],
-                [t("cluster.owner"), state.owner || "—"],
-                [t("cluster.address"), state.address || "—"],
-                [
-                  t("cluster.desired"),
-                  `${state.epoch || 0}.${state.desiredRevision}`,
-                ],
-                [t("cluster.applied"), state.appliedRevision],
-                ...(state.enabled
-                  ? [
-                      [t("cluster.initialWriter"), state.initialWriter || "—"],
-                      [t("cluster.writer"), state.writer || "—"],
-                      [
-                        t("cluster.configRole"),
-                        t(`cluster.role_${state.configRole}`),
-                      ],
-                      [
-                        t("cluster.replication"),
-                        t(`cluster.sync_${state.replicationState}`),
-                      ],
-                      [t("cluster.peer"), t(`cluster.peer_${state.peerState}`)],
-                      [t("cluster.epoch"), state.epoch],
-                      [
-                        t("cluster.peerVersion"),
-                        `${state.peerEpoch}.${state.peerRevision}`,
-                      ],
-                      [
-                        t("cluster.readyLocal"),
-                        t(
-                          state.localPreparedChecksum === state.checksum
-                            ? "cluster.yes"
-                            : "cluster.no"
-                        ),
-                      ],
-                      [
-                        t("cluster.readyPeer"),
-                        t(
-                          state.peerState === "online" &&
-                            state.peerPreparedChecksum === state.checksum
-                            ? "cluster.yes"
-                            : "cluster.no"
-                        ),
-                      ],
-                      [
-                        t("cluster.upstream"),
-                        t(`cluster.upstream_${state.upstreamState}`),
-                      ],
-                    ]
-                  : []),
-              ] as const
-            ).map(([label, value]) => (
-              <React.Fragment key={label}>
-                <dt className="text-muted-foreground">{label}</dt>
-                <dd className="font-mono break-all">{value}</dd>
-              </React.Fragment>
-            ))}
-          </dl>
-          {state.error && (
-            <Alert variant="destructive">
-              <AlertDescription>{state.error}</AlertDescription>
-            </Alert>
-          )}
-          {state.syncError && (
-            <Alert variant="destructive">
-              <AlertDescription>{state.syncError}</AlertDescription>
-            </Alert>
-          )}
-          {state.enabled && state.upstreamState === "unavailable" && (
-            <Alert>
-              <AlertDescription>
-                {t("cluster.upstreamUnavailableHint")}
-              </AlertDescription>
-            </Alert>
-          )}
-          {state.pendingUpdateId && (
-            <p className="text-sm text-muted-foreground">
-              {t("cluster.pending")}:{" "}
-              <code className="break-all">{state.pendingUpdateId}</code>
-            </p>
-          )}
-          {!state.enabled && (
+          {state.enabled ? (
+            <>
+              <NodeTiles state={state} />
+              <RouterTarget state={state} />
+              <Issues issues={state.issues ?? []} />
+            </>
+          ) : (
             <Alert>
               <AlertDescription>{t("cluster.configure")}</AlertDescription>
             </Alert>
           )}
+          <Details state={state} />
         </CardContent>
         {state.enabled && !state.paired && (
           <CardFooter className="flex flex-col items-start gap-3">
             <p className="text-sm text-muted-foreground">
-              {t("cluster.initHint")}
+              {t("cluster.initHint", { node: state.initialWriter || "—" })}
             </p>
             <Button
-              disabled={bootstrap.isPending || state.writer !== state.nodeId}
+              disabled={bootstrap.isPending || !canPair}
               onClick={() => bootstrap.mutate()}
             >
               {bootstrap.isPending && <Spinner data-icon="inline-start" />}
@@ -184,7 +131,7 @@ export function ClusterTab() {
           </CardFooter>
         )}
       </Card>
-      {state.enabled && <ClusterActions state={state} />}
+      {state.enabled && state.paired && <ClusterActions state={state} />}
       <OverrideForm
         key={JSON.stringify(node.data.node)}
         info={node.data}
@@ -197,121 +144,436 @@ export function ClusterTab() {
   )
 }
 
+const SYNC_VARIANT: Record<
+  ClusterSync,
+  "success" | "secondary" | "warning" | "destructive"
+> = {
+  synced: "success",
+  syncing: "secondary",
+  waiting: "warning",
+  local_only: "warning",
+  conflict: "destructive",
+  unpaired: "secondary",
+}
+
+function SyncBadge({ sync }: { sync: ClusterSync }) {
+  const { t } = useI18n()
+  return (
+    <Badge variant={SYNC_VARIANT[sync] ?? "secondary"}>
+      {t("cluster.syncLabel")}: {t(`cluster.sync_${sync}`)}
+    </Badge>
+  )
+}
+
+type TileState =
+  "serving" | "ready" | "notReady" | "offline" | "error" | "unknown"
+
+const TILE_STATE_CLASS: Record<TileState, string> = {
+  serving: "text-success",
+  ready: "text-foreground",
+  notReady: "text-warning",
+  offline: "text-destructive",
+  error: "text-destructive",
+  unknown: "text-muted-foreground",
+}
+
+function NodeTiles({ state }: { state: ClusterStatus }) {
+  const { t } = useI18n()
+  const local: TileState = state.serving
+    ? "serving"
+    : state.ready
+      ? "ready"
+      : "notReady"
+  const peer: TileState =
+    state.peer.state === "offline"
+      ? "offline"
+      : state.peer.state === "error"
+        ? "error"
+        : state.peer.state !== "online"
+          ? "unknown"
+          : state.peer.serving
+            ? "serving"
+            : state.peer.ready
+              ? "ready"
+              : "notReady"
+  return (
+    <div className="grid gap-3 sm:grid-cols-2">
+      <NodeTile
+        label={t("cluster.thisNode")}
+        id={state.nodeId}
+        role={state.role === "standalone" ? undefined : state.role}
+        state={local}
+      />
+      <NodeTile
+        label={t("cluster.peerNode")}
+        id={state.peerId}
+        role={state.peer.role}
+        state={peer}
+      />
+    </div>
+  )
+}
+
+function NodeTile({
+  label,
+  id,
+  role,
+  state,
+}: {
+  label: string
+  id?: string
+  role?: "primary" | "backup"
+  state: TileState
+}) {
+  const { t } = useI18n()
+  return (
+    <div
+      className={cn(
+        "flex flex-col gap-2 rounded-lg border p-3",
+        state === "serving" &&
+          "border-success bg-success/5 ring-1 ring-success/30"
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-sm text-muted-foreground">{label}</span>
+        {role ? (
+          <Badge variant={role === "primary" ? "default" : "secondary"}>
+            {t(`cluster.${role}`)}
+          </Badge>
+        ) : (
+          <Badge variant="outline">{t("cluster.roleUnknown")}</Badge>
+        )}
+      </div>
+      <span className="font-mono font-medium break-all">{id || "—"}</span>
+      <span className={cn("text-sm font-medium", TILE_STATE_CLASS[state])}>
+        {t(`cluster.state_${state}`)}
+      </span>
+    </div>
+  )
+}
+
+function RouterTarget({ state }: { state: ClusterStatus }) {
+  const { t } = useI18n()
+  const { ingress } = state
+  let target: React.ReactNode
+  if (ingress.state === "switching") target = t("cluster.routerSwitching")
+  else if (ingress.state === "unavailable")
+    target = (
+      <span className="text-destructive">{t("cluster.routerUnavailable")}</span>
+    )
+  else if (ingress.state === "observed" && ingress.owner)
+    target = (
+      <span className="font-mono">
+        {ingress.owner === state.nodeId
+          ? `${t("cluster.thisNode")} (${ingress.owner})`
+          : ingress.owner === state.peerId
+            ? `${t("cluster.peerNode")} (${ingress.owner})`
+            : ingress.owner}
+      </span>
+    )
+  else if (ingress.state === "observed")
+    target = (
+      <span className="text-warning">{t("cluster.routerUnknownAddress")}</span>
+    )
+  else target = t("cluster.routerUnknown")
+  return (
+    <p className="text-sm">
+      <span className="text-muted-foreground">{t("cluster.router")}: </span>
+      {target}
+      {ingress.address && (
+        <span className="ml-2 font-mono text-muted-foreground">
+          {ingress.address}
+        </span>
+      )}
+    </p>
+  )
+}
+
+const ISSUE_CODES = [
+  "unpaired",
+  "peer_offline",
+  "peer_error",
+  "sync_error",
+  "conflict",
+  "not_ready",
+  "peer_not_ready",
+  "router_unavailable",
+  "ingress_error",
+  "ingress_unknown",
+  "ingress_elsewhere",
+  "local_only",
+  "read_only",
+] as const
+type IssueCode = (typeof ISSUE_CODES)[number]
+const SEVERE = new Set<string>([
+  "peer_offline",
+  "peer_error",
+  "sync_error",
+  "conflict",
+  "not_ready",
+  "ingress_error",
+])
+
+function isKnownIssue(code: string): code is IssueCode {
+  return (ISSUE_CODES as readonly string[]).includes(code)
+}
+
+function Issues({ issues }: { issues: ClusterIssue[] }) {
+  const { t } = useI18n()
+  if (!issues.length)
+    return (
+      <Alert>
+        <CircleCheckIcon className="text-success" />
+        <AlertTitle className="text-success">{t("cluster.healthy")}</AlertTitle>
+        <AlertDescription>{t("cluster.healthyHint")}</AlertDescription>
+      </Alert>
+    )
+  return (
+    <div className="flex flex-col gap-2">
+      <p className="text-sm font-medium">{t("cluster.issuesTitle")}</p>
+      {issues.map((issue, index) => {
+        const code = isKnownIssue(issue.code) ? issue.code : null
+        const severe = SEVERE.has(issue.code)
+        const title: MessageKey = code
+          ? `cluster.issue_${code}`
+          : "cluster.issue_unknown"
+        return (
+          <Alert
+            key={`${issue.code}-${index}`}
+            variant={severe ? "destructive" : "default"}
+          >
+            {severe ? (
+              <CircleAlertIcon />
+            ) : (
+              <TriangleAlertIcon className="text-warning" />
+            )}
+            <AlertTitle>
+              {t(title)}
+              {!code && <span className="ml-1 font-mono">({issue.code})</span>}
+            </AlertTitle>
+            <AlertDescription>
+              {code && <p>{t(`cluster.issueHint_${code}`)}</p>}
+              {issue.message && (
+                <p className="font-mono text-xs break-all">{issue.message}</p>
+              )}
+            </AlertDescription>
+          </Alert>
+        )
+      })}
+    </div>
+  )
+}
+
+function Details({ state }: { state: ClusterStatus }) {
+  const { t, fmt } = useI18n()
+  const d = state.details
+  const short = (value?: string) =>
+    value ? <span title={value}>{value.slice(0, 12)}</span> : "—"
+  const rows: [string, React.ReactNode, React.ReactNode][] = [
+    [t("cluster.epoch"), d.epoch ?? "—", state.enabled ? d.peerEpoch : "—"],
+    [
+      t("cluster.revision"),
+      d.revision ?? "—",
+      state.enabled ? d.peerRevision : "—",
+    ],
+    [t("cluster.checksum"), short(d.checksum), short(d.peerChecksum)],
+  ]
+  return (
+    <Collapsible>
+      <CollapsibleTrigger asChild>
+        <Button variant="ghost" size="sm" className="group w-fit">
+          {t("cluster.details")}
+          <ChevronDownIcon
+            data-icon="inline-end"
+            className="transition-transform group-data-[state=open]:rotate-180"
+          />
+        </Button>
+      </CollapsibleTrigger>
+      <CollapsibleContent className="pt-2">
+        <dl className="grid grid-cols-[auto_1fr_1fr] gap-x-4 gap-y-1 text-sm">
+          <span />
+          <dt className="text-muted-foreground">{t("cluster.local")}</dt>
+          <dt className="text-muted-foreground">{t("cluster.remote")}</dt>
+          {rows.map(([label, local, peer]) => (
+            <React.Fragment key={label}>
+              <dt className="text-muted-foreground">{label}</dt>
+              <dd className="font-mono break-all">{local}</dd>
+              <dd className="font-mono break-all">{peer}</dd>
+            </React.Fragment>
+          ))}
+        </dl>
+        <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
+          {state.clusterId && (
+            <>
+              <dt className="text-muted-foreground">
+                {t("cluster.clusterId")}
+              </dt>
+              <dd className="font-mono break-all">{state.clusterId}</dd>
+            </>
+          )}
+          <dt className="text-muted-foreground">{t("cluster.pending")}</dt>
+          <dd className="font-mono break-all">{d.pendingUpdateId || "—"}</dd>
+          <dt className="text-muted-foreground">{t("cluster.lastSync")}</dt>
+          <dd>{d.lastSync ? fmt.dateTime(d.lastSync) : "—"}</dd>
+        </dl>
+      </CollapsibleContent>
+    </Collapsible>
+  )
+}
+
+type Pending =
+  | { kind: "switchover"; target: string; repoint: boolean }
+  | { kind: "promote" }
+  | { kind: "rejoin" }
+
 function ClusterActions({ state }: { state: ClusterStatus }) {
   const { t } = useI18n()
   const queryClient = useQueryClient()
-  const [fenced, setFenced] = React.useState(false)
-  const [archive, setArchive] = React.useState(false)
-  const failback =
-    state.nodeId === state.initialWriter &&
-    (state.peerTakenOver ||
-      (state.owner !== "" && state.owner !== state.nodeId))
+  const [pending, setPending] = React.useState<Pending | null>(null)
+  const [open, setOpen] = React.useState(false)
+  const ask = (next: Pending) => {
+    setPending(next)
+    setOpen(true)
+  }
   const action = useMutation({
-    mutationFn: (name: "transfer" | "promote" | "rejoin" | "failback") =>
-      api.cluster[name](),
-    onSuccess: () => {
-      setFenced(false)
-      setArchive(false)
+    mutationFn: (p: Pending) =>
+      p.kind === "switchover"
+        ? api.cluster.switchover(p.target)
+        : api.cluster[p.kind](),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["cluster"], data)
       void queryClient.invalidateQueries({ queryKey: ["cluster"] })
       void queryClient.invalidateQueries({ queryKey: ["rules"] })
       toast.success(t("cluster.actionDone"))
     },
     onError: (error) => toastError(error, t),
   })
+  const primary = state.role === "primary"
+  const peerOnline = state.peer.state === "online"
+  // A primary that lost the router only re-points it at itself; any other
+  // switch hands over the primary role and needs the peer online and in sync.
+  const repoint = primary && !state.serving
+  const handoverBlocked = !peerOnline
+    ? t("cluster.switchNeedsPeer")
+    : state.sync !== "synced"
+      ? t("cluster.switchNeedsSync")
+      : null
+  const showLocal = !primary || !state.serving
+  const showPeer = primary && Boolean(state.peerId)
+  const localBlocked = repoint ? null : handoverBlocked
+  const busy = action.isPending
+  const dialog = (() => {
+    if (!pending) return null
+    if (pending.kind === "switchover")
+      return pending.repoint
+        ? {
+            title: t("cluster.repointConfirmTitle"),
+            description: t("cluster.repointConfirmDescription"),
+            label: t("cluster.switchConfirm"),
+            destructive: false,
+          }
+        : {
+            title: t("cluster.switchConfirmTitle", { node: pending.target }),
+            description: t("cluster.switchConfirmDescription", {
+              node: pending.target,
+            }),
+            label: t("cluster.switchConfirm"),
+            destructive: false,
+          }
+    return {
+      title: t(`cluster.${pending.kind}ConfirmTitle`),
+      description: t(`cluster.${pending.kind}ConfirmDescription`),
+      label: t(`cluster.${pending.kind}`),
+      destructive: true,
+    }
+  })()
   return (
     <Card>
       <CardHeader>
         <CardTitle>{t("cluster.actions")}</CardTitle>
         <CardDescription>{t("cluster.actionHint")}</CardDescription>
       </CardHeader>
-      <CardContent>
-        <FieldGroup>
-          {state.upstreamState === "switch_pending" && (
-            <Alert>
-              <AlertDescription>
-                {t("cluster.switchPendingHint")}
-              </AlertDescription>
-            </Alert>
+      <CardContent className="flex flex-col gap-4">
+        <div className="flex flex-wrap items-center gap-2">
+          {showLocal && (
+            <Button
+              disabled={busy || localBlocked !== null}
+              onClick={() =>
+                ask({ kind: "switchover", target: state.nodeId, repoint })
+              }
+            >
+              {t("cluster.switchToLocal")}
+            </Button>
           )}
-          {state.takenOver && state.nodeId !== state.initialWriter && (
-            <p className="text-sm text-muted-foreground">
-              {t("cluster.takenOverHint")}
-            </p>
+          {showPeer && (
+            <Button
+              variant="outline"
+              disabled={busy || handoverBlocked !== null}
+              onClick={() =>
+                ask({
+                  kind: "switchover",
+                  target: state.peerId ?? "",
+                  repoint: false,
+                })
+              }
+            >
+              {t("cluster.switchToPeer")}
+            </Button>
           )}
-          {failback && (
-            <p className="text-sm text-muted-foreground">
-              {t("cluster.failbackHint")}
-            </p>
-          )}
-          <Field orientation="horizontal">
-            <Checkbox
-              id="confirm-fenced"
-              checked={fenced}
-              onCheckedChange={(value) => setFenced(value === true)}
-              disabled={action.isPending}
-            />
-            <FieldLabel htmlFor="confirm-fenced">
-              {t("cluster.fenced")}
-            </FieldLabel>
-          </Field>
-          <Field orientation="horizontal">
-            <Checkbox
-              id="confirm-archive"
-              checked={archive}
-              onCheckedChange={(value) => setArchive(value === true)}
-              disabled={action.isPending}
-            />
-            <FieldLabel htmlFor="confirm-archive">
-              {t("cluster.archive")}
-            </FieldLabel>
-          </Field>
-        </FieldGroup>
-      </CardContent>
-      <CardFooter className="flex flex-wrap gap-2">
-        <Button
-          variant="outline"
-          disabled={
-            action.isPending ||
-            !state.paired ||
-            state.writer !== state.nodeId ||
-            state.peerState !== "online" ||
-            Boolean(state.pendingUpdateId)
-          }
-          onClick={() => action.mutate("transfer")}
-        >
-          {t("cluster.transfer")}
-        </Button>
-        <Button
-          variant="destructive"
-          disabled={action.isPending || !state.paired || !fenced}
-          onClick={() => action.mutate("promote")}
-        >
-          {t("cluster.promote")}
-        </Button>
-        <Button
-          variant="outline"
-          disabled={
-            action.isPending || !archive || state.peerState !== "online"
-          }
-          onClick={() => action.mutate("rejoin")}
-        >
-          {t("cluster.rejoin")}
-        </Button>
-        {failback && (
-          <Button
-            disabled={
-              action.isPending ||
-              state.peerState !== "online" ||
-              state.replicationState !== "synced" ||
-              state.configRole === "read_only"
-            }
-            onClick={() => action.mutate("failback")}
-          >
-            {t("cluster.failback")}
-          </Button>
+          {busy && <Spinner />}
+        </div>
+        {((showLocal && localBlocked) || (showPeer && handoverBlocked)) && (
+          <p className="text-sm text-muted-foreground">
+            {(showLocal && localBlocked) || handoverBlocked}
+          </p>
         )}
-        {action.isPending && <Spinner />}
-      </CardFooter>
+        <Collapsible>
+          <CollapsibleTrigger asChild>
+            <Button variant="ghost" size="sm" className="group w-fit">
+              {t("cluster.advanced")}
+              <ChevronDownIcon
+                data-icon="inline-end"
+                className="transition-transform group-data-[state=open]:rotate-180"
+              />
+            </Button>
+          </CollapsibleTrigger>
+          <CollapsibleContent className="flex flex-col gap-3 pt-2">
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                variant="destructive"
+                disabled={busy || peerOnline}
+                onClick={() => ask({ kind: "promote" })}
+              >
+                {t("cluster.promote")}
+              </Button>
+              <span className="text-sm text-muted-foreground">
+                {t("cluster.promoteHint")}
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                variant="outline"
+                disabled={busy || !peerOnline}
+                onClick={() => ask({ kind: "rejoin" })}
+              >
+                {t("cluster.rejoin")}
+              </Button>
+              <span className="text-sm text-muted-foreground">
+                {t("cluster.rejoinHint")}
+              </span>
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      </CardContent>
+      <ConfirmDialog
+        open={open}
+        onOpenChange={setOpen}
+        title={dialog?.title}
+        description={dialog?.description}
+        confirmLabel={dialog?.label}
+        destructive={dialog?.destructive}
+        onConfirm={() => pending && action.mutateAsync(pending)}
+      />
     </Card>
   )
 }

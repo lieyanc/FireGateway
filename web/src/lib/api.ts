@@ -216,12 +216,11 @@ export const api = {
       post<{ connected: boolean; nodeId: string }>("/api/cluster/test-peer"),
     status: () => get<ClusterStatus>("/api/cluster"),
     bootstrap: () => post<{ initialized: boolean }>("/api/cluster/bootstrap"),
-    transfer: () => post<ClusterStatus>("/api/cluster/transfer"),
+    switchover: (target: string) =>
+      post<ClusterStatus>("/api/cluster/switchover", { target }),
     promote: () =>
-      post<ClusterStatus>("/api/cluster/promote", { fencedPeer: true }),
-    rejoin: () =>
-      post<ClusterStatus>("/api/cluster/rejoin", { archiveLocal: true }),
-    failback: () => post<ClusterStatus>("/api/cluster/failback"),
+      post<ClusterStatus>("/api/cluster/promote", { confirm: true }),
+    rejoin: () => post<ClusterStatus>("/api/cluster/rejoin", { confirm: true }),
   },
   node: {
     get: () => get<NodeInfo>("/api/node"),

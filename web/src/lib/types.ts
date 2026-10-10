@@ -433,34 +433,47 @@ export type NodeInfo = {
   rulesFile: string
   effectiveRules: Rule[]
 }
+export type ClusterRole = "primary" | "backup" | "standalone"
+export type ClusterSync =
+  "unpaired" | "synced" | "syncing" | "waiting" | "local_only" | "conflict"
+export type ClusterIssue = { code: string; message?: string }
 export type ClusterStatus = {
   enabled: boolean
   nodeId: string
-  clusterId: string
-  role: "standalone" | "active" | "standby" | "disconnected"
-  owner: string
-  address: string
-  desiredRevision: number
-  appliedRevision: number
-  checksum: string
-  error?: string
-  syncError?: string
-  lastSync?: string
+  peerId?: string
+  clusterId?: string
+  initialWriter?: string
   paired: boolean
-  epoch: number
-  writer: string
-  peerEpoch: number
-  takenOver: boolean
-  peerTakenOver: boolean
-  initialWriter: string
-  configRole: "writer" | "replica" | "read_only"
-  replicationState: "waiting" | "local_only" | "pending" | "synced" | "unpaired"
-  peerState: "unknown" | "online" | "offline" | "error"
-  upstreamState:
-    "unknown" | "observed" | "applied" | "unavailable" | "switch_pending"
-  peerRevision: number
-  peerChecksum: string
-  peerPreparedChecksum: string
-  localPreparedChecksum: string
-  pendingUpdateId?: string
+  /** The primary edits shared rules and keeps the router pointing at itself. */
+  role: ClusterRole
+  /** The router currently sends new connections to this node. */
+  serving: boolean
+  /** Every active rule is bound on this node. */
+  ready: boolean
+  sync: ClusterSync
+  /** Shared rules can be edited through this node. */
+  writable: boolean
+  peer: {
+    state: "online" | "offline" | "error" | "unknown" | ""
+    role?: "primary" | "backup"
+    ready: boolean
+    serving: boolean
+  }
+  ingress: {
+    state: "observed" | "switching" | "unavailable" | "unknown" | ""
+    /** Node id the router points at; "" when the address is unknown. */
+    owner?: string
+    address?: string
+  }
+  issues: ClusterIssue[]
+  details: {
+    epoch: number
+    peerEpoch: number
+    revision: number
+    peerRevision: number
+    checksum: string
+    peerChecksum?: string
+    pendingUpdateId?: string
+    lastSync?: string
+  }
 }
